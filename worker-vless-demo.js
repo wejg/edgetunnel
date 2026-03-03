@@ -101,7 +101,11 @@ function _p2(rem, ws, hd) {
 }
 
 async function _t3(host, port, data, ws, hd, box) {
-  const rem = connect({ hostname: host, port });
+  const rem = connect({ hostname: host, port: port });
+  await Promise.race([
+    rem.opened,
+    new Promise((_, rej) => setTimeout(() => rej(new Error('open timeout')), 5000))
+  ]);
   const w = rem.writable.getWriter();
   await w.write(data);
   w.releaseLock();
