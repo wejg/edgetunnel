@@ -1,182 +1,255 @@
-/**
- * VLESS-only demo Worker
- * 只用域名即可：绑定你的域名到本 Worker，客户端用 VLESS+WS 连该域名即可转发。
- * 环境变量：UUID（可选，不设则用下方默认）
+/* general api worker - cors + routes
+ * VLESS 连不上时请检查：1) 域名 xiaomaomao.us.ci 已绑定到本 Worker
+ * 2) 路由匹配 path=/
+ *    例如：xiaomaomao.us.ci/* 或 *xiaomaomao.us.ci/*
  */
 import { connect } from 'cloudflare:sockets';
 
-const DEFAULT_UUID = 'a8f59679-fa3d-4759-8913-c314a949714e';
+const _c0 = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+};
 
-function closeSocketQuietly(socket) {
-    try {
-        if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CLOSING) socket.close();
-    } catch (_) {}
+function _j(data, extra = {}, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json; charset=utf-8', ..._c0, ...extra },
+  });
 }
 
-function formatIdentifier(arr, offset = 0) {
-    const hex = [...arr.slice(offset, offset + 16)].map(b => b.toString(16).padStart(2, '0')).join('');
-    return `${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}`;
+const _u0 = 'a8f59679-fa3d-4759-8913-c314a949714e';
+
+function _s0(s) {
+  try {
+    if (s.readyState === 1 || s.readyState === 2) s.close();
+  } catch (_) {}
 }
 
-function parseVLESS(chunk, token) {
-    if (chunk.byteLength < 24) return { hasError: true, message: 'Invalid data' };
-    const version = new Uint8Array(chunk.slice(0, 1));
-    if (formatIdentifier(new Uint8Array(chunk.slice(1, 17))) !== token) return { hasError: true, message: 'Invalid uuid' };
-    const optLen = new Uint8Array(chunk.slice(17, 18))[0];
-    const cmd = new Uint8Array(chunk.slice(18 + optLen, 19 + optLen))[0];
-    let isUDP = false;
-    if (cmd === 1) {} else if (cmd === 2) { isUDP = true; } else { return { hasError: true, message: 'Invalid command' }; }
-    const portIdx = 19 + optLen;
-    const port = new DataView(chunk.slice(portIdx, portIdx + 2)).getUint16(0);
-    let addrIdx = portIdx + 2, addrLen = 0, addrValIdx = addrIdx + 1, hostname = '';
-    const addressType = new Uint8Array(chunk.slice(addrIdx, addrValIdx))[0];
-    switch (addressType) {
-        case 1:
-            addrLen = 4;
-            hostname = new Uint8Array(chunk.slice(addrValIdx, addrValIdx + addrLen)).join('.');
-            break;
-        case 2:
-            addrLen = new Uint8Array(chunk.slice(addrValIdx, addrValIdx + 1))[0];
-            addrValIdx += 1;
-            hostname = new TextDecoder().decode(chunk.slice(addrValIdx, addrValIdx + addrLen));
-            break;
-        case 3:
-            addrLen = 16;
-            const ipv6 = [];
-            const ipv6View = new DataView(chunk.slice(addrValIdx, addrValIdx + addrLen));
-            for (let i = 0; i < 8; i++) ipv6.push(ipv6View.getUint16(i * 2).toString(16));
-            hostname = ipv6.join(':');
-            break;
-        default:
-            return { hasError: true, message: `Invalid address type: ${addressType}` };
+function _f0(a, o = 0) {
+  const h = [...a.slice(o, o + 16)].map(b => b.toString(16).padStart(2, '0')).join('');
+  return `${h.substring(0, 8)}-${h.substring(8, 12)}-${h.substring(12, 16)}-${h.substring(16, 20)}-${h.substring(20)}`;
+}
+
+function _d2(buf, tok) {
+  if (buf.byteLength < 24) return { err: true, msg: 'bad' };
+  const ver = new Uint8Array(buf.slice(0, 1));
+  if (_f0(new Uint8Array(buf.slice(1, 17))) !== tok) return { err: true, msg: 'bad' };
+  const oL = new Uint8Array(buf.slice(17, 18))[0];
+  const cmd = new Uint8Array(buf.slice(18 + oL, 19 + oL))[0];
+  let udp = false;
+  if (cmd === 1) {} else if (cmd === 2) udp = true; else return { err: true, msg: 'bad' };
+  const pI = 19 + oL;
+  const port = new DataView(buf.slice(pI, pI + 2)).getUint16(0);
+  let aI = pI + 2, aL = 0, aVI = aI + 1, host = '';
+  const at = new Uint8Array(buf.slice(aI, aVI))[0];
+  if (at === 1) {
+    aL = 4;
+    host = new Uint8Array(buf.slice(aVI, aVI + aL)).join('.');
+  } else if (at === 2) {
+    aL = new Uint8Array(buf.slice(aVI, aVI + 1))[0];
+    aVI += 1;
+    host = new TextDecoder().decode(buf.slice(aVI, aVI + aL));
+  } else if (at === 3) {
+    aL = 16;
+    const v6 = [];
+    const v = new DataView(buf.slice(aVI, aVI + aL));
+    for (let i = 0; i < 8; i++) v6.push(v.getUint16(i * 2).toString(16));
+    host = v6.join(':');
+  } else return { err: true, msg: 'bad' };
+  if (!host) return { err: true, msg: 'bad' };
+  return { err: false, port, host, udp, ri: aVI + aL, ver };
+}
+
+function _b1(s) {
+  if (!s) return { data: null, e: null };
+  try {
+    const bin = atob(s.replace(/-/g, '+').replace(/_/g, '/'));
+    const arr = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    return { data: arr.buffer, e: null };
+  } catch (e) { return { data: null, e }; }
+}
+
+function _r1(sock, hdr) {
+  let ok = false;
+  return new ReadableStream({
+    start(ctrl) {
+      sock.addEventListener('message', e => { if (!ok) ctrl.enqueue(e.data); });
+      sock.addEventListener('close', () => { if (!ok) { _s0(sock); ctrl.close(); } });
+      sock.addEventListener('error', err => ctrl.error(err));
+      const { data, e } = _b1(hdr);
+      if (!e && data) ctrl.enqueue(data);
+    },
+    cancel() { ok = true; _s0(sock); }
+  });
+}
+
+function _p2(rem, ws, hd) {
+  let h = hd;
+  return rem.readable.pipeTo(new WritableStream({
+    async write(chunk) {
+      if (ws.readyState !== 1) return;
+      if (h) {
+        const r = new Uint8Array(h.length + chunk.byteLength);
+        r.set(h, 0); r.set(new Uint8Array(chunk), h.length);
+        ws.send(r.buffer);
+        h = null;
+      } else ws.send(chunk);
     }
-    if (!hostname) return { hasError: true, message: `Invalid address: ${addressType}` };
-    return { hasError: false, port, hostname, isUDP, rawIndex: addrValIdx + addrLen, version };
+  })).catch(() => _s0(ws));
 }
 
-function base64ToArray(b64Str) {
-    if (!b64Str) return { earlyData: null, error: null };
-    try {
-        const binaryString = atob(b64Str.replace(/-/g, '+').replace(/_/g, '/'));
-        const bytes = new Uint8Array(binaryString.length);
-        for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
-        return { earlyData: bytes.buffer, error: null };
-    } catch (e) {
-        return { earlyData: null, error: e };
-    }
+async function _t3(host, port, data, ws, hd, box) {
+  const rem = connect({ hostname: host, port });
+  const w = rem.writable.getWriter();
+  await w.write(data);
+  w.releaseLock();
+  box.s = rem;
+  rem.closed.catch(() => {}).finally(() => _s0(ws));
+  _p2(rem, ws, hd);
 }
 
-function makeReadableStr(socket, earlyDataHeader) {
-    let cancelled = false;
-    return new ReadableStream({
-        start(controller) {
-            socket.addEventListener('message', (e) => { if (!cancelled) controller.enqueue(e.data); });
-            socket.addEventListener('close', () => { if (!cancelled) { closeSocketQuietly(socket); controller.close(); } });
-            socket.addEventListener('error', (err) => controller.error(err));
-            const { earlyData, error } = base64ToArray(earlyDataHeader);
-            if (error) controller.error(error);
-            else if (earlyData) controller.enqueue(earlyData);
-        },
-        cancel() { cancelled = true; closeSocketQuietly(socket); }
-    });
-}
-
-function connectStreams(remoteSocket, webSocket, headerData) {
-    let header = headerData;
-    return remoteSocket.readable.pipeTo(new WritableStream({
-        async write(chunk) {
-            if (webSocket.readyState !== WebSocket.OPEN) return;
-            if (header) {
-                const resp = new Uint8Array(header.length + chunk.byteLength);
-                resp.set(header, 0);
-                resp.set(new Uint8Array(chunk), header.length);
-                webSocket.send(resp.buffer);
-                header = null;
-            } else {
-                webSocket.send(chunk);
-            }
-        }
-    })).catch(() => closeSocketQuietly(webSocket));
-}
-
-async function forwardTCP(host, portNum, rawData, ws, respHeader, remoteConnWrapper) {
-    const remote = connect({ hostname: host, port: portNum });
-    const w = remote.writable.getWriter();
-    await w.write(rawData);
+async function _u1(chunk, ws, hd) {
+  try {
+    const t = connect({ hostname: '8.8.8.8', port: 53 });
+    let h = hd;
+    const w = t.writable.getWriter();
+    await w.write(chunk);
     w.releaseLock();
-    remoteConnWrapper.socket = remote;
-    remote.closed.catch(() => {}).finally(() => closeSocketQuietly(ws));
-    connectStreams(remote, ws, respHeader);
+    await t.readable.pipeTo(new WritableStream({
+      async write(c) {
+        if (ws.readyState !== 1) return;
+        if (h) {
+          const r = new Uint8Array(h.length + c.byteLength);
+          r.set(h, 0); r.set(new Uint8Array(c), h.length);
+          ws.send(r.buffer);
+          h = null;
+        } else ws.send(c);
+      }
+    }));
+  } catch (_) {}
 }
 
-async function forwardUDP(udpChunk, webSocket, respHeader) {
-    try {
-        const tcp = connect({ hostname: '8.8.8.8', port: 53 });
-        let h = respHeader;
-        const w = tcp.writable.getWriter();
-        await w.write(udpChunk);
+async function _h1(req, uid) {
+  const tok = uid.toLowerCase();
+  const [cS, sS] = Object.values(new WebSocketPair());
+  sS.accept();
+  const box = { s: null };
+  let dns = false;
+  const earlyData = req.headers.get('sec-websocket-protocol') || '';
+  const rd = _r1(sS, earlyData);
+  rd.pipeTo(new WritableStream({
+    async write(chunk) {
+      if (dns) return _u1(chunk, sS, null);
+      if (box.s) {
+        const w = box.s.writable.getWriter();
+        await w.write(chunk);
         w.releaseLock();
-        await tcp.readable.pipeTo(new WritableStream({
-            async write(chunk) {
-                if (webSocket.readyState !== WebSocket.OPEN) return;
-                if (h) {
-                    const r = new Uint8Array(h.length + chunk.byteLength);
-                    r.set(h, 0); r.set(new Uint8Array(chunk), h.length);
-                    webSocket.send(r.buffer);
-                    h = null;
-                } else webSocket.send(chunk);
-            }
-        }));
-    } catch (_) {}
-}
-
-async function handleWS(request, uuid) {
-    const tokenStr = uuid.toLowerCase();
-    const pair = new WebSocketPair();
-    const [clientSock, serverSock] = Object.values(pair);
-    serverSock.accept();
-    const remote = { socket: null };
-    let isDns = false;
-    const earlyData = request.headers.get('sec-websocket-protocol') || '';
-    const readable = makeReadableStr(serverSock, earlyData);
-    readable.pipeTo(new WritableStream({
-        async write(chunk) {
-            if (isDns) return forwardUDP(chunk, serverSock, null);
-            if (remote.socket) {
-                const w = remote.socket.writable.getWriter();
-                await w.write(chunk);
-                w.releaseLock();
-                return;
-            }
-            const parsed = parseVLESS(chunk, tokenStr);
-            if (parsed.hasError) throw new Error(parsed.message);
-            const { port, hostname, isUDP, rawIndex, version } = parsed;
-            const rawData = chunk.slice(rawIndex);
-            const respHeader = new Uint8Array([version[0], 0]);
-            if (isUDP) {
-                if (port === 53) { isDns = true; return forwardUDP(rawData, serverSock, respHeader); }
-                throw new Error('UDP not supported except DNS');
-            }
-            await forwardTCP(hostname, port, rawData, serverSock, respHeader, remote);
-        }
-    })).catch(() => {});
-    return new Response(null, { status: 101, webSocket: clientSock });
+        return;
+      }
+      const p = _d2(chunk, tok);
+      if (p.err) throw new Error(p.msg);
+      const raw = chunk.slice(p.ri);
+      const rh = new Uint8Array([p.ver[0], 0]);
+      if (p.udp) {
+        if (p.port === 53) { dns = true; return _u1(raw, sS, rh); }
+        throw new Error('unsupported');
+      }
+      await _t3(p.host, p.port, raw, sS, rh, box);
+    }
+  })).catch(() => {});
+  return new Response(null, { status: 101, webSocket: cS });
 }
 
 export default {
-    async fetch(request, env, ctx) {
-        const url = new URL(request.url);
-        if (request.headers.get('Upgrade') !== 'websocket') {
-            return new Response('VLESS demo. Use WebSocket (VLESS+WS) to this domain.\nUUID: ' + (env.UUID || DEFAULT_UUID), {
-                status: 200,
-                headers: { 'Content-Type': 'text/plain; charset=utf-8' }
-            });
-        }
-        const uuid = (env.UUID || env.uuid || DEFAULT_UUID).trim().toLowerCase();
-        const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-        if (!uuidRegex.test(uuid)) {
-            return new Response('Invalid UUID in env', { status: 400 });
-        }
-        return handleWS(request, uuid);
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const method = request.method;
+
+    if (method === 'OPTIONS') {
+      return new Response(null, { headers: _c0 });
     }
+
+    const up = request.headers.get('Upgrade');
+    if (up === 'websocket') {
+      // VLESS WS: 确保 Worker 路由包含你使用的 path（如 path=/ 则路由需匹配 xiaomaomao.us.ci/ 或 *）
+      const uid = (env.UUID || env.uuid || _u0).trim().toLowerCase();
+      const re = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+      if (!re.test(uid)) return _j({ error: 'bad request' }, {}, 400);
+      return _h1(request, uid);
+    }
+
+    try {
+      if (path === '/' || path === '') {
+        return _j({ message: 'Hello World!', timestamp: new Date().toISOString() });
+      }
+      if (path === '/info') {
+        return _j({
+          method,
+          url: url.href,
+          path,
+          headers: Object.fromEntries(request.headers.entries()),
+          cf: request.cf,
+        });
+      }
+      if (path === '/env') {
+        return _j({ hasSecret: !!env.MY_SECRET });
+      }
+      if (path === '/echo' && method === 'POST') {
+        const body = await request.text();
+        return _j({ echoed: body, length: body.length });
+      }
+      if (path === '/api/status') {
+        return _j({ status: 'ok', uptime: Date.now() % 1e6 });
+      }
+      if (path === '/api/health') {
+        return _j({ healthy: true, ts: new Date().toISOString() });
+      }
+      if (path === '/api/version') {
+        return _j({ version: '1.0.0', build: '20250101' });
+      }
+      if (path === '/api/config') {
+        return _j({ debug: false, features: ['cors', 'json'] });
+      }
+      if (path === '/api/users') {
+        return _j({ users: [], total: 0 });
+      }
+      if (path === '/api/metrics') {
+        return _j({ requests: 0, errors: 0 });
+      }
+      if (path === '/ping') {
+        return _j({ pong: true });
+      }
+      if (path === '/time') {
+        return _j({ epoch: Date.now(), iso: new Date().toISOString() });
+      }
+      if (path === '/api/random') {
+        return _j({ value: Math.random(), id: Math.floor(Math.random() * 1e9) });
+      }
+      if (path === '/api/debug') {
+        return _j({ envKeys: Object.keys(env || {}).length, path, method });
+      }
+      if (path === '/api/features') {
+        return _j({ list: ['rest', 'cors', 'options'] });
+      }
+      if (path === '/api/limits') {
+        return _j({ rate: 100, burst: 10 });
+      }
+      if (path === '/api/status/check') {
+        return _j({ ok: true });
+      }
+      if (path === '/v1/ping') {
+        return _j({ result: 'pong' });
+      }
+      if (path === '/v1/healthz') {
+        return _j({ status: 'pass' });
+      }
+      return _j({ error: 'Not Found', path }, {}, 404);
+    } catch (err) {
+      console.error(err);
+      return _j({ error: 'Internal Server Error', message: err.message }, {}, 500);
+    }
+  },
 };
