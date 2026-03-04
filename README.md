@@ -124,6 +124,9 @@
 | **PROXYIP** | ❌ | `proxyip.cmliussss.net:443` | 全局自定义反代 IP  |
 | **URL** | ❌ | `https://cloudflare-error-page-3th.pages.dev` | 默认主页伪装地址（可填写网页 URL 或 `1101`） |
 | **GO2SOCKS5** | ❌ | `blog.cmliussss.com`,`*.ip111.cn`,`*google.com` | 强制走 SOCKS5 的名单 (`*` 为全局，域名用逗号分隔) |
+| **WS_PATH** | ❌ | `/_next/static/chunk` | 可选：仅当请求 path 匹配时才进入代理，不设则任意 path 放行 |
+| **WS_HEADER** | ❌ | 随机字符串 | 可选：请求头需带 `WS_HEADER_NAME` 且值等于此处才放行，不设则不校验 |
+| **WS_HEADER_NAME** | ❌ | `X-Token` | 可选：与 WS_HEADER 配合，不设则默认 `X-Token` |
 
 ---
 
