@@ -45,6 +45,7 @@ func main() {
 		logger.Stderr(logger.LevelError, "main", fmt.Sprintf("Xray 启动失败，退出: %v", err))
 		os.Exit(1)
 	}
+	defer func() { _ = runner.Stop() }() // 进程退出（含 panic）时尽量关闭 Xray
 
 	logger.Stdout(logger.LevelInfo, "main",
 		fmt.Sprintf("服务就绪，代理端口 SOCKS %d / HTTP %d，日志目录 %s", xray.PortSOCKS, xray.PortHTTP, logDir))
@@ -134,6 +135,7 @@ func runMonitor(logDir, monitorLog string, runner *xray.Runner) {
 			var startErr error
 			for i := 0; i < xrayStartRetries; i++ {
 				if err := runner.Start(nil); err == nil {
+					logger.ToFileOnly(monitorLog, logger.LevelInfo, "main", "全流程重启完成")
 					return
 				}
 				startErr = err

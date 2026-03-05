@@ -43,7 +43,14 @@ const CORS_HEADERS = {
  * @param {number} [status=200] - HTTP 状态码
  */
 function jsonResponse(data, extra = {}, status = 200) {
-  return new Response(JSON.stringify(data), {
+  let body;
+  try {
+    body = JSON.stringify(data);
+  } catch (_) {
+    body = '{"error":"Internal Server Error","message":"JSON serialization failed"}';
+    status = 500;
+  }
+  return new Response(body, {
     status,
     headers: { 'Content-Type': 'application/json; charset=utf-8', ...CORS_HEADERS, ...extra },
   });
@@ -169,16 +176,22 @@ function pipeRemoteToWS(remoteSocket, ws, firstChunkHeader) {
 /**
  * 建立到 target host:port 的 TCP 连接，写入首包 data，并将远端 readable 转发到 ws；
  * 响应首块带 VLESS 头 hd。连接信息存入 box.s，关闭时顺带关闭 ws。
+ * 连接超时或写入失败时会关闭 rem 并重新抛出错误。
  */
 async function connectTCPAndPipe(host, port, data, ws, hd, box) {
   const rem = connect({ hostname: host, port });
-  await Promise.race([
-    rem.opened,
-    new Promise((_, rej) => setTimeout(() => rej(new Error('open timeout')), 5000))
-  ]);
-  const w = rem.writable.getWriter();
-  await w.write(data);
-  w.releaseLock();
+  try {
+    await Promise.race([
+      rem.opened,
+      new Promise((_, rej) => setTimeout(() => rej(new Error('open timeout')), 5000))
+    ]);
+    const w = rem.writable.getWriter();
+    await w.write(data);
+    w.releaseLock();
+  } catch (e) {
+    safeClose(rem);
+    throw e;
+  }
   box.s = rem;
   rem.closed.catch(() => {}).finally(() => safeClose(ws));
   pipeRemoteToWS(rem, ws, hd);
@@ -251,6 +264,7 @@ async function handleVLESSWebSocket(req, uid) {
     }
   })).catch((err) => {
     log(LOG_LEVEL.ERROR, COMPONENT.WS, 'VLESS 管道异常', { message: err?.message });
+    safeClose(serverWS);
   });
   log(LOG_LEVEL.INFO, COMPONENT.WS, 'WebSocket 已接受（VLESS）');
   return new Response(null, { status: 101, webSocket: clientWS });
@@ -350,8 +364,9 @@ export default {
       log(LOG_LEVEL.WARN, COMPONENT.MAIN, '未匹配路由', { path });
       return jsonResponse({ error: 'Not Found', path }, {}, 404);
     } catch (err) {
-      log(LOG_LEVEL.ERROR, COMPONENT.MAIN, '未处理异常', { message: err.message });
-      return jsonResponse({ error: 'Internal Server Error', message: err.message }, {}, 500);
+      const msg = err?.message ?? String(err);
+      log(LOG_LEVEL.ERROR, COMPONENT.MAIN, '未处理异常', { message: msg });
+      return jsonResponse({ error: 'Internal Server Error', message: msg }, {}, 500);
     }
   },
 };

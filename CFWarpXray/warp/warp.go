@@ -226,8 +226,11 @@ func wrapCmdErr(cmd string, err error) error {
 // ConnectWarp 若当前 warp-cli status 未包含 Connected，则执行 connect 并轮询 status，
 // 在 timeout 内等待出现 Connected；超时返回错误。
 func ConnectWarp(timeout time.Duration) error {
-	out, _ := exec.Command("warp-cli", "--accept-tos", "status").CombinedOutput()
-	if bytes.Contains(out, []byte("Connected")) {
+	out, err := exec.Command("warp-cli", "--accept-tos", "status").CombinedOutput()
+	if err != nil && errors.Is(err, exec.ErrNotFound) {
+		return wrapCmdErr("warp-cli status", err)
+	}
+	if err == nil && bytes.Contains(out, []byte("Connected")) {
 		return nil
 	}
 	if err := exec.Command("warp-cli", "--accept-tos", "connect").Run(); err != nil {
@@ -299,6 +302,7 @@ func GetWarpInterface() (string, error) {
 
 // ConfigureIPTables 先清空 nat POSTROUTING 与 FORWARD 链，再添加与 vh-warp 一致的
 // NAT MASQUERADE 与 FORWARD 规则，使经指定 WARP 网卡出站的流量正确转发。任一 -A 规则失败即返回错误。
+// 注意：flush 阶段错误被忽略（如无权限时 -F 可能失败），仅 -A 阶段失败会返回错误。
 func ConfigureIPTables(iface string) error {
 	flush := [][]string{
 		{"iptables", "-t", "nat", "-F", "POSTROUTING"},
@@ -338,6 +342,9 @@ func ReconnectWarp() error {
 func FullRestartWarp(logDir string) error {
 	if logDir == "" {
 		logDir = "."
+	}
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		return fmt.Errorf("创建日志目录 %s: %w", logDir, err)
 	}
 	CleanOldProcess()
 	if err := EnsureDbus(); err != nil {
