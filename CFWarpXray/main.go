@@ -4,22 +4,27 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
+	"CFWarpXray/internal/logger"
 	"CFWarpXray/warp"
 	"CFWarpXray/xray"
 )
 
 const (
-	defaultLogDir     = "/var/log/warp-xray" // 默认日志目录，可通过环境变量 WARP_XRAY_LOG_DIR 覆盖
-	monitorInterval   = 5 * time.Second      // 监控轮询间隔（与 vh-warp warp-monitor.sh 一致）
-	xrayStartRetries  = 3                    // 全流程重启后 Xray 启动失败时的重试次数
-	xrayStartRetryGap = 2 * time.Second      // 上述重试间隔
+	// defaultLogDir 默认日志目录；可通过环境变量 WARP_XRAY_LOG_DIR 覆盖
+	defaultLogDir = "/var/log/warp-xray"
+	// monitorInterval 健康检查轮询间隔，与 vh-warp warp-monitor.sh 一致
+	monitorInterval = 5 * time.Second
+	// xrayStartRetries 全流程重启后 Xray 启动失败时的最大重试次数
+	xrayStartRetries = 3
+	// xrayStartRetryGap 上述重试之间的等待时间
+	xrayStartRetryGap = 2 * time.Second
 )
 
 func main() {
@@ -28,20 +33,21 @@ func main() {
 		logDir = defaultLogDir
 	}
 
-	// 1. WARP 完整初始化（清理 → TUN → dbus → warp-svc → 注册/连接 → iptables）
+	// 1. WARP 完整初始化：清理旧进程 → TUN → dbus → warp-svc → 注册/连接 → iptables
 	if err := warp.InitWarp(logDir); err != nil {
-		log.Printf("[致命] WARP 初始化失败: %v", err)
+		logger.Stderr(logger.LevelError, "main", fmt.Sprintf("WARP 初始化失败，退出: %v", err))
 		os.Exit(1)
 	}
 
 	// 2. 启动 Xray 代理（SOCKS 16666 + HTTP 16667，出口 freedom 走 WARP）
 	var runner xray.Runner
 	if err := runner.Start(nil); err != nil {
-		log.Printf("[致命] Xray 启动失败: %v", err)
+		logger.Stderr(logger.LevelError, "main", fmt.Sprintf("Xray 启动失败，退出: %v", err))
 		os.Exit(1)
 	}
 
-	log.Printf("[启动] 服务就绪，代理端口 SOCKS %d / HTTP %d，日志目录 %s", xray.PortSOCKS, xray.PortHTTP, logDir)
+	logger.Stdout(logger.LevelInfo, "main",
+		fmt.Sprintf("服务就绪，代理端口 SOCKS %d / HTTP %d，日志目录 %s", xray.PortSOCKS, xray.PortHTTP, logDir))
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -51,70 +57,97 @@ func main() {
 	ticker := time.NewTicker(monitorInterval)
 	defer ticker.Stop()
 
-	// 启动后立即做一次健康检查，不等待首个 tick 周期
+	// 串行化每次监控，避免全流程重启未完成时下一轮 tick 并发执行
+	var monitorMu sync.Mutex
+	// 启动后立即执行一次健康检查，不等待首个 tick
+	monitorMu.Lock()
 	runMonitor(logDir, monitorLog, &runner)
+	monitorMu.Unlock()
 
-	// 3. 进入监控循环：每 5 秒检查 warp-svc 存活与 WARP 连接状态，异常时自愈
+	// 3. 监控循环：每 5 秒检查 warp-svc 存活与 WARP 连接状态，异常时自愈
 	for {
 		select {
 		case <-sigCh:
-			log.Println("[退出] 收到信号，关闭 Xray 后退出")
+			logger.Stdout(logger.LevelInfo, "main", "收到退出信号，关闭 Xray 后退出")
 			_ = runner.Stop()
 			os.Exit(0)
 		case <-ticker.C:
+			monitorMu.Lock()
 			runMonitor(logDir, monitorLog, &runner)
+			monitorMu.Unlock()
 		}
 	}
 }
 
-// runMonitor 执行一次监控：warp-svc 不在则全流程重启；仅未 Connected 则重连 WARP 并重启 Xray。
-// 全流程重启后 Xray 启动失败会重试若干次，避免偶发端口占用或时序问题导致代理长时间不可用。
+// runMonitor 执行一次健康检查与自愈逻辑：
+//   - 若 warp-svc 未运行：全流程重启 WARP，然后重试启动 Xray 至多 xrayStartRetries 次；
+//   - 若 WARP 未 Connected：先尝试 ReconnectWarp，失败则全流程重启，再启动/重试 Xray；
+//   - 重连成功后重启 Xray 使代理流量重新经 WARP。
+// 内部 panic 会被 recover 并写入 monitor.log 与 stderr，不导致主进程退出。
 func runMonitor(logDir, monitorLog string, runner *xray.Runner) {
+	defer func() {
+		if v := recover(); v != nil {
+			msg := "监控 panic 已恢复: " + fmt.Sprint(v)
+			logger.Stderr(logger.LevelError, "main", msg)
+			logger.ToFileOnly(monitorLog, logger.LevelError, "main", msg)
+		}
+	}()
 	if !warp.IsWarpSvcRunning() {
-		warp.LogToFile(monitorLog, "[监控] warp-svc 未运行，执行全流程重启")
+		logger.ToFileOnly(monitorLog, logger.LevelWarn, "main", "warp-svc 未运行，执行全流程重启")
 		_ = runner.Stop()
 		if err := warp.FullRestartWarp(logDir); err != nil {
-			warp.LogToFile(monitorLog, "[监控] 全流程重启失败: "+err.Error())
+			logger.ToFileOnly(monitorLog, logger.LevelError, "main", "全流程重启失败: "+err.Error())
 			return
 		}
 		var lastErr error
 		for i := 0; i < xrayStartRetries; i++ {
 			if err := runner.Start(nil); err != nil {
 				lastErr = err
-				warp.LogToFile(monitorLog, fmt.Sprintf("[监控] 全流程重启后 Xray 启动失败，第 %d/%d 次: %v", i+1, xrayStartRetries, err))
+				logger.ToFileOnly(monitorLog, logger.LevelWarn, "main",
+					fmt.Sprintf("全流程重启后 Xray 启动失败，第 %d/%d 次: %v", i+1, xrayStartRetries, err))
 			} else {
-				warp.LogToFile(monitorLog, "[监控] 全流程重启完成")
+				logger.ToFileOnly(monitorLog, logger.LevelInfo, "main", "全流程重启完成")
 				return
 			}
 			if i < xrayStartRetries-1 {
 				time.Sleep(xrayStartRetryGap)
 			}
 		}
-		warp.LogToFile(monitorLog, fmt.Sprintf("[监控] 全流程重启后 Xray 启动仍失败（%v），下次周期再试", lastErr))
+		logger.ToFileOnly(monitorLog, logger.LevelError, "main",
+			fmt.Sprintf("全流程重启后 Xray 启动仍失败（%v），下次周期再试", lastErr))
 		return
 	}
 	if !warp.IsConnected() {
-		warp.LogToFile(monitorLog, "[监控] WARP 已断开，尝试重连并重启 Xray")
+		logger.ToFileOnly(monitorLog, logger.LevelWarn, "main", "WARP 已断开，尝试重连并重启 Xray")
 		if err := warp.ReconnectWarp(); err != nil {
-			warp.LogToFile(monitorLog, "[监控] 重连失败，触发全流程重启: "+err.Error())
+			logger.ToFileOnly(monitorLog, logger.LevelWarn, "main", "重连失败，触发全流程重启: "+err.Error())
 			_ = runner.Stop()
 			if err2 := warp.FullRestartWarp(logDir); err2 != nil {
-				warp.LogToFile(monitorLog, "[监控] 全流程重启失败: "+err2.Error())
+				logger.ToFileOnly(monitorLog, logger.LevelError, "main", "全流程重启失败: "+err2.Error())
+				if startErr := runner.Start(nil); startErr != nil {
+					logger.ToFileOnly(monitorLog, logger.LevelError, "main", "部分恢复 Xray 失败: "+startErr.Error())
+				} else {
+					logger.ToFileOnly(monitorLog, logger.LevelWarn, "main", "已尝试部分恢复 Xray，请检查 WARP/iptables 状态")
+				}
 				return
 			}
+			var startErr error
 			for i := 0; i < xrayStartRetries; i++ {
 				if err := runner.Start(nil); err == nil {
 					return
 				}
+				startErr = err
 				if i < xrayStartRetries-1 {
 					time.Sleep(xrayStartRetryGap)
 				}
 			}
+			logger.ToFileOnly(monitorLog, logger.LevelError, "main",
+				fmt.Sprintf("全流程重启后 Xray 启动仍失败（%v），下次周期再试", startErr))
 			return
 		}
-		warp.LogToFile(monitorLog, "[监控] WARP 已重连，重启 Xray")
+		logger.ToFileOnly(monitorLog, logger.LevelInfo, "main", "WARP 已重连，重启 Xray")
 		if err := runner.Restart(); err != nil {
-			warp.LogToFile(monitorLog, "[监控] Xray 重启失败: "+err.Error())
+			logger.ToFileOnly(monitorLog, logger.LevelError, "main", "Xray 重启失败: "+err.Error())
 		}
 	}
 }

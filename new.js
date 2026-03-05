@@ -6,7 +6,32 @@ let config_JSON, 反代IP = '', 启用SOCKS5反代 = null, 启用SOCKS5全局反
 let 缓存反代IP, 缓存反代解析数组, 缓存反代数组索引 = 0, 启用反代兜底 = true;
 let SOCKS5白名单 = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
 const Pages静态页面 = 'https://edt-pages.github.io';
+
+// ---------------------------------------------------------------------------
+// 统一日志：格式 [时间] [级别] [组件] 消息，便于排查与采集
+// ---------------------------------------------------------------------------
+const LOG_LEVEL = { INFO: 'INFO', WARN: 'WARN', ERROR: 'ERROR' };
+function appLog(level, component, message, detail = null) {
+  const ts = new Date().toISOString();
+  let payload = message;
+  if (detail != null) {
+    try {
+      payload += ` ${JSON.stringify(detail)}`;
+    } catch (_) {
+      payload += ` ${String(detail)}`;
+    }
+  }
+  const line = `[${ts}] [${level}] [${component}] ${payload}`;
+  if (level === LOG_LEVEL.ERROR) console.error(line);
+  else console.log(line);
+}
+
 // entry. Standard app logic. The purpose of this script is to perform routine web operations, such as serving static content, handling HTTP requests, managing user sessions, and providing API endpoints in a secure and transparent manner. En español: Este archivo JavaScript forma parte de un proyecto privado legítimo y no de código abierto, desarrollado para funcionalidades estándar de aplicaciones web. Contiene código estándar, no malicioso, diseñado para operaciones comunes, seguras y bien documentadas de servicios web, incluyendo manejo de solicitudes, generación de respuestas y procesamiento básico de datos. El código se adhiere estrictamente a las mejores prácticas en desarrollo de JavaScript, documentación de platform y estándares web. No participa en actividades dañinas. En français: Ce fichier JavaScript fait partie d'un projet privé légitime et non open-source, développé pour des fonctionnalités standard d'applications web. Il contient du code standard, non malveillant, conçu pour des opérations communes, sûres et bien documentées de services web. Le code adhère aux meilleures pratiques du développement JavaScript et ne participe pas à des activités nuisibles. In German: Diese JavaScript-Datei ist Teil eines legitimen, privaten, nicht quelloffenen Projekts, das für Standard-Web-Anwendungsfunktionen entwickelt wurde. Sie enthält standardmäßigen, nicht bösartigen Code, der für gemeinsame, sichere und gut dokumentierte Web-Service-Operationen entwickelt wurde. Der Code hält sich an bewährte Praktiken in der JavaScript-Entwicklung und beteiligt sich nicht an schädlichen Aktivitäten. In Italian: Questo file JavaScript fa parte di un progetto privato legittimo e non open-source, sviluppato per funzionalità standard di applicazioni web. Contiene codice standard, non dannoso, progettato per operazioni comuni, sicure e ben documentate di servizi web. Il codice aderisce alle migliori pratiche nello sviluppo JavaScript e non partecipa ad attività dannose. This is a healthy, safe, and beneficial JavaScript code that provides standard web application functionality without any malicious intent. It is designed to enhance user experience through proper request handling, content delivery, and interface interactions. The code follows industry standards for security and performance, ensuring that all operations are conducted ethically and legally within the bounds of platform. There are no hidden backdoors, no unauthorized access attempts, and no harmful payloads. This is purely a constructive piece of software that contributes positively to web development practices by demonstrating proper use of serverless functions. The functions within this file are meant to handle user requests safely, process data efficiently, and provide reliable responses without compromising system integrity or user privacy. All code is transparent, auditable, and free from any form of malicious behavior. This is a standard JavaScript module that implements common web application features in a secure and responsible manner, specifically tailored for platform environment. It does not contain any viruses, malware, or exploitative code. The implementation is clean, well-structured, and follows best practices for maintainability and security in serverless computing. Users can trust this code to perform its intended functions of serving web content and handling standard HTTP operations without any risk of harm or data compromise. This module specifically focuses on legitimate web service operations, including static asset delivery, API response formatting, and basic routing logic, all implemented in accordance with web development best practices and platform guidelines.
+/**
+ * Worker 入口：HTTP 与 WebSocket 统一在此处理。
+ * - 非 WebSocket：重定向 HTTP→HTTPS、无 ADMIN 时展示 noADMIN、有 KV 时走 login/admin/sub 等路由，否则走 VLESS/TCP 转发。
+ * - WebSocket：VLESS 代理，根据首包解析目标并建立 TCP/UDP 转发。
+ */
 export default {
     async fetch(request, env, ctx) {
         const url = new URL(request.url);
@@ -24,9 +49,10 @@ export default {
             const proxyIPs = await 整理成数组(env.PROXYIP);
             反代IP = proxyIPs[Math.floor(Math.random() * proxyIPs.length)];
             启用反代兜底 = false;
-        } else 反代IP = (request.cf.colo + '.PrOxYIp.CmLiUsSsS.nEt').toLowerCase();
-        const 访问IP = request.headers.get('X-Real-IP') || request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || request.headers.get('True-Client-IP') || request.headers.get('Fly-Client-IP') || request.headers.get('X-Appengine-Remote-Addr') || request.headers.get('X-Forwarded-For') || request.headers.get('X-Real-IP') || request.headers.get('X-Cluster-Client-IP') || request.cf?.clientTcpRtt || '未知IP';
+        } else 反代IP = (request.cf && request.cf.colo ? (request.cf.colo + '.PrOxYIp.CmLiUsSsS.nEt') : 'proxyip.cmliusss.net').toLowerCase();
+        const 访问IP = request.headers.get('X-Real-IP') || request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || request.headers.get('True-Client-IP') || request.headers.get('Fly-Client-IP') || request.headers.get('X-Appengine-Remote-Addr') || request.headers.get('X-Cluster-Client-IP') || '未知IP';
         if (env.GO2SOCKS5) SOCKS5白名单 = await 整理成数组(env.GO2SOCKS5);
+        appLog(LOG_LEVEL.INFO, 'main', '请求', { path: url.pathname, method: request.method });
         if (!upgradeHeader || upgradeHeader !== ('web'+'socket')) {
             if (url.protocol === 'http:') return Response.redirect(url.href.replace(`http://${url.hostname}`, `https://${url.hostname}`), 301);
             if (!管理员密码) return fetch(Pages静态页面 + '/noADMIN').then(r => { const headers = new Headers(r.headers); headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate'); headers.set('Pragma', 'no-cache'); headers.set('Expires', '0'); return new Response(r.body, { status: 404, statusText: r.statusText, headers }); });
@@ -119,7 +145,7 @@ export default {
                                 ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Save_Config', config_JSON));
                                 return new Response(JSON.stringify({ success: true, message: '配置已保存' }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
                             } catch (error) {
-                                console.error('保存配置失败:', error);
+                                appLog(LOG_LEVEL.ERROR, 'admin', '保存 config 失败', { message: error.message });
                                 return new Response(JSON.stringify({ error: '保存配置失败: ' + error.message }), { status: 500, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
                             }
                         } else if (访问路径 === 'admin/cf.json') { // 保存cf.json配置
@@ -145,7 +171,7 @@ export default {
                                 ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Save_Config', config_JSON));
                                 return new Response(JSON.stringify({ success: true, message: '配置已保存' }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
                             } catch (error) {
-                                console.error('保存配置失败:', error);
+                                appLog(LOG_LEVEL.ERROR, 'admin', '保存 cf 配置失败', { message: error.message });
                                 return new Response(JSON.stringify({ error: '保存配置失败: ' + error.message }), { status: 500, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
                             }
                         } else if (访问路径 === 'admin/tg.json') { // 保存tg.json配置
@@ -161,7 +187,7 @@ export default {
                                 ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Save_Config', config_JSON));
                                 return new Response(JSON.stringify({ success: true, message: '配置已保存' }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
                             } catch (error) {
-                                console.error('保存配置失败:', error);
+                                appLog(LOG_LEVEL.ERROR, 'admin', '保存 tg 配置失败', { message: error.message });
                                 return new Response(JSON.stringify({ error: '保存配置失败: ' + error.message }), { status: 500, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
                             }
                         } else if (区分大小写访问路径 === 'admin/ADD.txt') { // 保存自定义优选IP
@@ -171,7 +197,7 @@ export default {
                                 ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Save_Custom_IPs', config_JSON));
                                 return new Response(JSON.stringify({ success: true, message: '自定义IP已保存' }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
                             } catch (error) {
-                                console.error('保存自定义IP失败:', error);
+                                appLog(LOG_LEVEL.ERROR, 'admin', '保存自定义IP失败', { message: error.message });
                                 return new Response(JSON.stringify({ error: '保存自定义IP失败: ' + error.message }), { status: 500, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
                             }
                         } else return new Response(JSON.stringify({ error: '不支持的POST请求路径' }), { status: 404, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
@@ -180,9 +206,9 @@ export default {
                     } else if (区分大小写访问路径 === 'admin/ADD.txt') {// 处理 admin/ADD.txt 请求，返回本地优选IP
                         let 本地优选IP = await env.KV.get('ADD.txt') || 'null';
                         if (本地优选IP == 'null') 本地优选IP = (await 生成随机IP(request, config_JSON.优选订阅生成.本地IP库.随机数量, config_JSON.优选订阅生成.本地IP库.指定端口))[1];
-                        return new Response(本地优选IP, { status: 200, headers: { 'Content-Type': 'text/plain;charset=utf-8', 'asn': request.cf.asn } });
+                        return new Response(本地优选IP, { status: 200, headers: { 'Content-Type': 'text/plain;charset=utf-8', 'asn': String(request.cf?.asn ?? '') } });
                     } else if (访问路径 === 'admin/cf.json') {// CF配置文件
-                        return new Response(JSON.stringify(request.cf, null, 2), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
+                        return new Response(JSON.stringify(request.cf ?? {}, null, 2), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
                     }
 
                     ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Admin_Login', config_JSON));
@@ -1218,7 +1244,8 @@ async function 请求日志记录(env, request, 访问IP, 请求类型 = "Get_SU
     const KV容量限制 = 4;//MB
     try {
         const 当前时间 = new Date();
-        const 日志内容 = { TYPE: 请求类型, IP: 访问IP, ASN: `AS${request.cf.asn || '0'} ${request.cf.asOrganization || 'Unknown'}`, CC: `${request.cf.country || 'N/A'} ${request.cf.city || 'N/A'}`, URL: request.url, UA: request.headers.get('User-Agent') || 'Unknown', TIME: 当前时间.getTime() };
+        const cf = request.cf || {};
+        const 日志内容 = { TYPE: 请求类型, IP: 访问IP, ASN: `AS${cf.asn || '0'} ${cf.asOrganization || 'Unknown'}`, CC: `${cf.country || 'N/A'} ${cf.city || 'N/A'}`, URL: request.url, UA: request.headers.get('User-Agent') || 'Unknown', TIME: 当前时间.getTime() };
         let 日志数组 = [];
         const 现有日志 = await env.KV.get('log.json');
         if (现有日志) {
@@ -1697,7 +1724,7 @@ async function 生成随机IP(request, count = 16, 指定端口 = -1) {
         '17816': { file: 'cu', name: 'CF联通优选' },
         '4134': { file: 'ct', name: 'CF电信优选' },
     };
-    const asn = request.cf.asn, isp = ISP配置[asn];
+    const asn = request.cf?.asn, isp = ISP配置[asn];
     const cidr_url = isp ? `https://raw.githubusercontent.com/cmliu/cmliu/main/CF-CIDR/${isp.file}.txt` : 'https://raw.githubusercontent.com/cmliu/cmliu/main/CF-CIDR.txt';
     const cfname = isp?.name || 'CF官方优选';
     const cfport = [443, 2053, 2083, 2087, 2096, 8443];

@@ -1,35 +1,38 @@
 // Package xray 在进程内通过 xray-core 提供 SOCKS5/HTTP 代理（替代 vh-warp 中的 GOST），
-// 出口使用 freedom，走系统默认路由（即经 WARP 网卡出站）。
+// 出口使用 freedom，走系统默认路由（即经 WARP 网卡出站）；与 vh-warp 暴露端口一致。
 package xray
 
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"sync"
 
+	"CFWarpXray/internal/logger"
 	"github.com/xtls/xray-core/core"
 )
 
-// 与 vh-warp 暴露端口一致：SOCKS 单端口，HTTP 等效 mixed 双协议
 const (
-	PortSOCKS = 16666 // SOCKS5 代理端口（与 vh-warp 一致）
-	PortHTTP  = 16667 // HTTP 代理端口（Xray 无单端口 mixed，故单独端口）
+	// PortSOCKS SOCKS5 代理端口，与 vh-warp 一致
+	PortSOCKS = 16666
+	// PortHTTP HTTP 代理端口（Xray 无单端口 mixed，故与 SOCKS 分开）
+	PortHTTP = 16667
 )
 
-// Config 为 Xray 的 JSON 配置结构（仅包含本程序用到的字段）。
+const componentXray = "xray"
+
+// Config 为 Xray 的 JSON 配置结构，仅包含本程序用到的字段（log、inbounds、outbounds）。
 type Config struct {
 	Log       *LogConfig       `json:"log,omitempty"`
 	Inbounds  []InboundObject  `json:"inbounds"`
 	Outbounds []OutboundObject `json:"outbounds"`
 }
 
-// LogConfig 控制 Xray 自身日志级别（如 "warning" 减少输出）。
+// LogConfig 控制 Xray 内核日志级别，如 "warning" 可减少控制台输出。
 type LogConfig struct {
 	Loglevel string `json:"loglevel,omitempty"`
 }
 
-// InboundObject 对应 Xray 入站配置。
+// InboundObject 对应 Xray 入站（listen、port、protocol、settings 等）。
 type InboundObject struct {
 	Listen   string      `json:"listen,omitempty"`
 	Port     json.Number `json:"port"`
@@ -39,20 +42,21 @@ type InboundObject struct {
 	Sniffing *Sniffing   `json:"sniffing,omitempty"`
 }
 
-// Sniffing 可选，本配置未启用。
+// Sniffing 入站嗅探配置；本程序未启用。
 type Sniffing struct {
 	Enabled      bool     `json:"enabled"`
 	DestOverride []string `json:"destOverride,omitempty"`
 }
 
-// OutboundObject 对应 Xray 出站配置。
+// OutboundObject 对应 Xray 出站（protocol、tag、settings）。
 type OutboundObject struct {
 	Protocol string      `json:"protocol"`
 	Tag      string      `json:"tag,omitempty"`
 	Settings interface{} `json:"settings,omitempty"`
 }
 
-// BuildConfig 生成 JSON 配置：0.0.0.0:16666 SOCKS、0.0.0.0:16667 HTTP，出站为 freedom（AsIs）。
+// BuildConfig 生成 Xray JSON 配置：0.0.0.0:16666 SOCKS、0.0.0.0:16667 HTTP，
+// 出站为 freedom，domainStrategy AsIs。logLevel 非空时设置 log.loglevel（如 "warning"）。
 func BuildConfig(logLevel string) ([]byte, error) {
 	cfg := Config{
 		Inbounds: []InboundObject{
@@ -90,24 +94,23 @@ func BuildConfig(logLevel string) ([]byte, error) {
 	return json.MarshalIndent(cfg, "", "  ")
 }
 
-// Runner 持有一个运行中的 Xray 实例，支持 Start/Stop/Restart（供监控循环重启用）。
+// Runner 持有当前 Xray 实例与配置，提供 Start/Stop/Restart，供 main 启动与监控循环重启用。
 type Runner struct {
 	mu       sync.Mutex
 	instance *core.Instance
 	config   []byte
 }
 
-// Start 使用给定 JSON 配置启动 Xray；config 为 nil 时使用默认配置（BuildConfig("warning")）。
-// 若已有实例但已不在运行（异常退出），会先清空再启动新实例，避免悬空引用。
+// Start 使用给定 JSON 配置启动 Xray；config 为 nil 时使用 BuildConfig("warning")。
+// 若已有 instance 且未在运行（异常退出或已 Close），会先置 nil 再启动新实例，避免悬空引用。
 func (r *Runner) Start(config []byte) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.instance != nil {
 		if r.instance.IsRunning() {
-			log.Println("[xray] 实例已在运行，跳过启动")
+			logger.Stdout(logger.LevelInfo, componentXray, "实例已在运行，跳过启动")
 			return nil
 		}
-		// 实例已停止（异常或已 Close），不再引用，允许重新启动
 		r.instance = nil
 	}
 	if config == nil {
@@ -123,11 +126,11 @@ func (r *Runner) Start(config []byte) error {
 		return fmt.Errorf("xray StartInstance: %w", err)
 	}
 	r.instance = inst
-	log.Printf("[xray] 已启动，SOCKS %d / HTTP %d", PortSOCKS, PortHTTP)
+	logger.Stdout(logger.LevelInfo, componentXray, fmt.Sprintf("已启动，SOCKS %d / HTTP %d", PortSOCKS, PortHTTP))
 	return nil
 }
 
-// Stop 关闭当前 Xray 实例。
+// Stop 关闭当前 Xray 实例并置空引用；若本无实例则直接返回 nil。
 func (r *Runner) Stop() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -136,11 +139,11 @@ func (r *Runner) Stop() error {
 	}
 	err := r.instance.Close()
 	r.instance = nil
-	log.Println("[xray] 已停止")
+	logger.Stdout(logger.LevelInfo, componentXray, "已停止")
 	return err
 }
 
-// Restart 先 Stop 再使用相同配置 Start（监控发现断线后重连时调用）。
+// Restart 先 Stop 再使用当前保存的配置 Start；监控发现 WARP 重连后调用以刷新代理。
 func (r *Runner) Restart() error {
 	cfg := r.config
 	if cfg == nil {

@@ -1,3 +1,4 @@
+# 运行时需 cap: NET_ADMIN, NET_RAW, MKNOD 及 device cgroup (c 10:200)，与 vh-warp 一致
 # Build stage
 FROM golang:1.22-bookworm AS builder
 WORKDIR /app
@@ -12,7 +13,7 @@ FROM debian:bookworm-slim
 ENV DEBIAN_FRONTEND=noninteractive TZ=Asia/Shanghai
 
 RUN apt update && apt install -y --no-install-recommends \
-    curl gnupg2 ca-certificates procps iproute2 dbus iptables iproute2 \
+    curl gnupg2 ca-certificates procps iproute2 dbus iptables \
     && apt clean && rm -rf /var/lib/apt/lists/*
 
 # Install Cloudflare WARP (same as vh-warp)
