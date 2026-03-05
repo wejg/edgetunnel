@@ -654,6 +654,7 @@ func ConfigureIPTables(iface string, logDir string) error {
 	ipt := iptablesPath()
 	flush := [][]string{
 		{ipt, "-t", "nat", "-F", "POSTROUTING"},
+		{ipt, "-t", "mangle", "-F", "OUTPUT"},
 		{ipt, "-F", "FORWARD"},
 	}
 	for _, c := range flush {
@@ -671,32 +672,58 @@ func ConfigureIPTables(iface string, logDir string) error {
 			return fmt.Errorf("iptables %v 失败: %w, 输出: %s", c, err, out)
 		}
 	}
-	// 策略路由：对访问 16666/16667 的入站连接打 CONNMARK，回复包打 fwmark，查 table 100 走原网关
+	// 策略路由：所有从 WARP 网卡发出的包打 fwmark，走 table 100 走原网卡
+	// 避免任何经 WARP 出站的包（包括 Xray 作为客户端的连接）导致源 IP 问题
 	gw, mainIface, err := readDefaultRoute(logDir)
 	if err != nil {
 		return nil // 无保存的路由则只做上面规则，不报错
 	}
-	// 避免重复添加，先删再加（忽略删除错误）
 	_ = exec.Command("ip", "rule", "del", "fwmark", fmt.Sprintf("%d", proxyReplyFwmark), "table", fmt.Sprintf("%d", mainRouteTable)).Run()
 	_ = exec.Command("ip", "route", "flush", "table", fmt.Sprintf("%d", mainRouteTable)).Run()
-	// mangle: 入站 16666/16667 打 connmark
+	// --- 策略路由核心：用 CONNMARK 让代理端口的 **整个连接** 所有包都走 table 100 ---
+	//
+	// 为什么不能只用 MARK？
+	// Linux 内核对后续包有 conntrack 路由缓存，mangle OUTPUT 里用 MARK 只在首包
+	// 触发 re-route，后续包可能跳过 re-route 直接沿用缓存的路由（走了 WARP 的 table 65743），
+	// 导致 SOCKS5 握手数据发不回客户端 → curl 报 "connection to proxy closed"。
+	//
+	// 方案：
+	//  1) mangle OUTPUT: --sport 16666/16667 的新连接 → CONNMARK --save-mark（把 fwmark 存到 connmark）
+	//  2) mangle OUTPUT: 所有包先 CONNMARK --restore-mark（从 connmark 恢复 fwmark），这样后续包也有 fwmark
+	//  3) ip rule fwmark 0x1 lookup 100
+	//  restore 规则必须放在 save 之前（-A 追加顺序），因为新连接首包需要先 MARK → save，
+	//  而后续包需要先 restore 拿到 mark。实际上 restore 对新连接首包是无效的（connmark 为 0），
+	//  所以把 restore 放第一条，save 放最后一条，逻辑正确。
+
+	mangleRules := [][]string{
+		// restore: 每个包进入 OUTPUT 时，从 connmark 恢复 fwmark（后续包靠这条拿到标记并触发 re-route）
+		{ipt, "-t", "mangle", "-A", "OUTPUT", "-j", "CONNMARK", "--restore-mark"},
+	}
 	for _, port := range []int{portSOCKS, portHTTP} {
-		c := []string{ipt, "-t", "mangle", "-A", "INPUT", "-p", "tcp", "--dport", fmt.Sprintf("%d", port), "-j", "CONNMARK", "--set-mark", fmt.Sprintf("%d", proxyReplyFwmark)}
+		mangleRules = append(mangleRules,
+			// 首包：源端口是代理端口的包打 fwmark
+			[]string{ipt, "-t", "mangle", "-A", "OUTPUT", "-p", "tcp", "--sport", fmt.Sprintf("%d", port), "-j", "MARK", "--set-mark", fmt.Sprintf("%d", proxyReplyFwmark)},
+			// 首包：把 fwmark 存入 connmark，后续包的 restore 就能拿到
+			[]string{ipt, "-t", "mangle", "-A", "OUTPUT", "-p", "tcp", "--sport", fmt.Sprintf("%d", port), "-j", "CONNMARK", "--save-mark"},
+		)
+	}
+	for _, c := range mangleRules {
 		if out, e := exec.Command(c[0], c[1:]...).CombinedOutput(); e != nil {
-			return fmt.Errorf("iptables mangle INPUT: %w, 输出: %s", e, out)
+			return fmt.Errorf("iptables %v: %w, 输出: %s", c[2:], e, out)
 		}
 	}
-	// mangle: 出站包若属于已打标连接，则打 fwmark，以便 ip rule 选 table 100
-	c := []string{ipt, "-t", "mangle", "-A", "OUTPUT", "-m", "connmark", "--mark", fmt.Sprintf("%d", proxyReplyFwmark), "-j", "MARK", "--set-mark", fmt.Sprintf("%d", proxyReplyFwmark)}
-	if out, e := exec.Command(c[0], c[1:]...).CombinedOutput(); e != nil {
-		return fmt.Errorf("iptables mangle OUTPUT: %w, 输出: %s", e, out)
-	}
-	// 查 table 100 的包走原默认网关
+
 	if out, e := exec.Command("ip", "rule", "add", "fwmark", fmt.Sprintf("%d", proxyReplyFwmark), "table", fmt.Sprintf("%d", mainRouteTable)).CombinedOutput(); e != nil {
 		return fmt.Errorf("ip rule add: %w, 输出: %s", e, out)
 	}
 	if out, e := exec.Command("ip", "route", "add", "default", "via", gw, "dev", mainIface, "table", fmt.Sprintf("%d", mainRouteTable)).CombinedOutput(); e != nil {
 		return fmt.Errorf("ip route add table %d: %w, 输出: %s", mainRouteTable, e, out)
+	}
+
+	// 代理回复包走 table 100 从 eth0 出去时，源 IP 可能仍是 WARP 内部地址，需要 MASQUERADE 改成公网 IP
+	natMasq := []string{ipt, "-t", "nat", "-A", "POSTROUTING", "-m", "mark", "--mark", fmt.Sprintf("%d", proxyReplyFwmark), "-o", mainIface, "-j", "MASQUERADE"}
+	if out, e := exec.Command(natMasq[0], natMasq[1:]...).CombinedOutput(); e != nil {
+		return fmt.Errorf("iptables nat POSTROUTING mark→MASQUERADE: %w, 输出: %s", e, out)
 	}
 	return nil
 }

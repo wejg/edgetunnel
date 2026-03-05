@@ -43,7 +43,7 @@ func main() {
 	// 2. 启动 Xray 代理（SOCKS 16666 + HTTP 16667，出口 freedom 走 WARP；日志写入 logDir）
 	xrayLogLevel := os.Getenv("WARP_XRAY_LOG_LEVEL")
 	if xrayLogLevel == "" {
-		xrayLogLevel = "warning"
+		xrayLogLevel = "info"
 	}
 	xrayConfig, err := xray.BuildConfig(xrayLogLevel, logDir)
 	if err != nil {
