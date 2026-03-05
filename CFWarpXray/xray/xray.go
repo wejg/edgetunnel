@@ -5,6 +5,7 @@ package xray
 import (
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"sync"
 
 	"CFWarpXray/internal/logger"
@@ -38,9 +39,11 @@ type Config struct {
 	Outbounds []OutboundObject `json:"outbounds"`
 }
 
-// LogConfig 控制 Xray 内核日志级别，如 "warning" 可减少控制台输出。
+// LogConfig 控制 Xray 内核日志；Access/Error 为文件路径时写入 logDir 下 xray-access.log / xray-error.log。
 type LogConfig struct {
 	Loglevel string `json:"loglevel,omitempty"`
+	Access   string `json:"access,omitempty"`
+	Error    string `json:"error,omitempty"`
 }
 
 // InboundObject 对应 Xray 入站（listen、port、protocol、settings 等）。
@@ -67,8 +70,9 @@ type OutboundObject struct {
 }
 
 // BuildConfig 生成 Xray JSON 配置：0.0.0.0:16666 SOCKS、0.0.0.0:16667 HTTP，
-// 出站为 freedom，domainStrategy AsIs。logLevel 非空时设置 log.loglevel（如 "warning"）。
-func BuildConfig(logLevel string) ([]byte, error) {
+// 出站为 freedom，domainStrategy AsIs。logLevel 非空时设置 log.loglevel（如 "warning"）；
+// logDir 非空时将 access/error 日志写入 logDir/xray-access.log、logDir/xray-error.log。
+func BuildConfig(logLevel, logDir string) ([]byte, error) {
 	cfg := Config{
 		Inbounds: []InboundObject{
 			{
@@ -99,8 +103,12 @@ func BuildConfig(logLevel string) ([]byte, error) {
 			},
 		},
 	}
-	if logLevel != "" {
+	if logLevel != "" || logDir != "" {
 		cfg.Log = &LogConfig{Loglevel: logLevel}
+		if logDir != "" {
+			cfg.Log.Access = filepath.Join(logDir, "xray-access.log")
+			cfg.Log.Error = filepath.Join(logDir, "xray-error.log")
+		}
 	}
 	return json.MarshalIndent(cfg, "", "  ")
 }
@@ -126,7 +134,7 @@ func (r *Runner) Start(config []byte) error {
 	}
 	if config == nil {
 		var err error
-		config, err = BuildConfig("warning")
+		config, err = BuildConfig("warning", "")
 		if err != nil {
 			return err
 		}
@@ -159,7 +167,7 @@ func (r *Runner) Restart() error {
 	cfg := r.config
 	if cfg == nil {
 		var err error
-		cfg, err = BuildConfig("warning")
+		cfg, err = BuildConfig("warning", "")
 		if err != nil {
 			return err
 		}

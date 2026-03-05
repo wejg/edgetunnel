@@ -27,7 +27,8 @@
 
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
-| `WARP_XRAY_LOG_DIR` | 日志目录（init.log、monitor.log、warp-svc.log） | `/var/log/warp-xray` |
+| `WARP_XRAY_LOG_DIR` | 日志目录（init.log、monitor.log、warp-svc.log、xray-access.log、xray-error.log） | `/var/log/warp-xray` |
+| `WARP_XRAY_LOG_LEVEL` | Xray 内核日志级别：`debug`、`info`、`warning`、`error`、`none`；设为 `info` 可看到连接等更多日志 | `warning` |
 | `WARP_XRAY_AUTO_INSTALL` | 设为 `0` 时禁用自动安装 cloudflare-warp；未设置或非 0 时，若未检测到 warp-svc 会在 Debian/Ubuntu 上尝试 `apt-get install cloudflare-warp`（需 root 与网络） | 启用 |
 
 ## 代理端口
@@ -61,6 +62,7 @@ docker run -d --name cfwarpxray --cap-add=NET_ADMIN --cap-add=NET_RAW --cap-add=
 - 初始化失败：查看 stderr 及 `$WARP_XRAY_LOG_DIR/init.log`
 - 运行中自愈：查看 `monitor.log`
 - warp-svc 自身输出：`warp-svc.log`
+- Xray 入站/错误：`xray-access.log`、`xray-error.log`
 - 未找到命令：确认已安装 cloudflare-warp 且 `warp-svc`、`warp-cli` 在 PATH 中
 - iptables 失败：确认有 NET_ADMIN 权限或容器已按上例加 cap
 - 代理无流量：程序会自动开启 `net.ipv4.ip_forward=1`（与 vh-warp 的 `--sysctl net.ipv4.ip_forward=1` 一致），若仍无流量请检查 iptables 与 WARP 网卡

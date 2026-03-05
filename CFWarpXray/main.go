@@ -40,9 +40,24 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 2. 启动 Xray 代理（SOCKS 16666 + HTTP 16667，出口 freedom 走 WARP）
+	// 2. 启动 Xray 代理（SOCKS 16666 + HTTP 16667，出口 freedom 走 WARP；日志写入 logDir）
+	xrayLogLevel := os.Getenv("WARP_XRAY_LOG_LEVEL")
+	if xrayLogLevel == "" {
+		xrayLogLevel = "warning"
+	}
+	xrayConfig, err := xray.BuildConfig(xrayLogLevel, logDir)
+	if err != nil {
+		logger.Stderr(logger.LevelError, "main", fmt.Sprintf("生成 Xray 配置失败: %v", err))
+		warp.Disconnect()
+		os.Exit(1)
+	}
+	// 将实际传给 Xray 的 JSON 写入 logDir，便于核对（与 xray-core 官方 log/inbounds/outbounds 格式一致）
+	configPath := filepath.Join(logDir, "xray-config.json")
+	if err := os.WriteFile(configPath, xrayConfig, 0644); err != nil {
+		logger.Stderr(logger.LevelWarn, "main", "写入 xray-config.json 失败: "+err.Error())
+	}
 	var runner xray.Runner
-	if err := runner.Start(nil); err != nil {
+	if err := runner.Start(xrayConfig); err != nil {
 		logger.Stderr(logger.LevelError, "main", fmt.Sprintf("Xray 启动失败，退出: %v", err))
 		warp.Disconnect()
 		os.Exit(1)
@@ -64,7 +79,7 @@ func main() {
 	var monitorMu sync.Mutex
 	// 启动后立即执行一次健康检查，不等待首个 tick
 	monitorMu.Lock()
-	runMonitor(logDir, monitorLog, &runner)
+	runMonitor(logDir, monitorLog, &runner, xrayConfig)
 	monitorMu.Unlock()
 
 	// 3. 监控循环：每 5 秒检查 warp-svc 存活与 WARP 连接状态，异常时自愈
@@ -77,7 +92,7 @@ func main() {
 			os.Exit(0)
 		case <-ticker.C:
 			monitorMu.Lock()
-			runMonitor(logDir, monitorLog, &runner)
+			runMonitor(logDir, monitorLog, &runner, xrayConfig)
 			monitorMu.Unlock()
 		}
 	}
@@ -88,7 +103,7 @@ func main() {
 //   - 若 WARP 未 Connected：先尝试 ReconnectWarp，失败则全流程重启，再启动/重试 Xray；
 //   - 重连成功后重启 Xray 使代理流量重新经 WARP。
 // 内部 panic 会被 recover 并写入 monitor.log 与 stderr，不导致主进程退出。
-func runMonitor(logDir, monitorLog string, runner *xray.Runner) {
+func runMonitor(logDir, monitorLog string, runner *xray.Runner, xrayConfig []byte) {
 	defer func() {
 		if v := recover(); v != nil {
 			msg := "监控 panic 已恢复: " + fmt.Sprint(v)
@@ -105,7 +120,7 @@ func runMonitor(logDir, monitorLog string, runner *xray.Runner) {
 		}
 		var lastErr error
 		for i := 0; i < xrayStartRetries; i++ {
-			if err := runner.Start(nil); err != nil {
+			if err := runner.Start(xrayConfig); err != nil {
 				lastErr = err
 				logger.ToFileOnly(monitorLog, logger.LevelWarn, "main",
 					fmt.Sprintf("全流程重启后 Xray 启动失败，第 %d/%d 次: %v", i+1, xrayStartRetries, err))
@@ -128,7 +143,7 @@ func runMonitor(logDir, monitorLog string, runner *xray.Runner) {
 			_ = runner.Stop()
 			if err2 := warp.FullRestartWarp(logDir); err2 != nil {
 				logger.ToFileOnly(monitorLog, logger.LevelError, "main", "全流程重启失败: "+err2.Error())
-				if startErr := runner.Start(nil); startErr != nil {
+				if startErr := runner.Start(xrayConfig); startErr != nil {
 					logger.ToFileOnly(monitorLog, logger.LevelError, "main", "部分恢复 Xray 失败: "+startErr.Error())
 				} else {
 					logger.ToFileOnly(monitorLog, logger.LevelWarn, "main", "已尝试部分恢复 Xray，请检查 WARP/iptables 状态")
@@ -137,7 +152,7 @@ func runMonitor(logDir, monitorLog string, runner *xray.Runner) {
 			}
 			var startErr error
 			for i := 0; i < xrayStartRetries; i++ {
-				if err := runner.Start(nil); err == nil {
+				if err := runner.Start(xrayConfig); err == nil {
 					logger.ToFileOnly(monitorLog, logger.LevelInfo, "main", "全流程重启完成")
 					return
 				}

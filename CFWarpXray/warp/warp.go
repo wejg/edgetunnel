@@ -89,6 +89,9 @@ func InitWarp(logDir string) error {
 	if err := ensureIptablesInstalled(initLog, logInfo); err != nil {
 		return fmt.Errorf("准备 iptables: %w", err)
 	}
+	if err := SaveDefaultRoute(logDir); err != nil {
+		logInfo("警告: 保存默认路由失败（" + err.Error() + "），将跳过策略路由，外网连代理可能断线")
+	}
 	logInfo("[步骤] 开始连接 WARP（轮询 status 等待 Connected，最多 3 分钟）...")
 	if err := ConnectWarp(ConnectPollTimeout, logInfo); err != nil {
 		return fmt.Errorf("连接 WARP: %w", err)
@@ -106,8 +109,8 @@ func InitWarp(logDir string) error {
 		return fmt.Errorf("开启 IPv4 转发: %w", err)
 	}
 	logInfo("IPv4 转发已开启")
-	logInfo("[步骤] 配置 iptables（NAT + FORWARD）...")
-	if err := ConfigureIPTables(iface); err != nil {
+	logInfo("[步骤] 配置 iptables（NAT + FORWARD）与策略路由（代理回复走原网卡）...")
+	if err := ConfigureIPTables(iface, logDir); err != nil {
 		return fmt.Errorf("配置 iptables: %w", err)
 	}
 	logInfo("iptables 规则配置完成")
@@ -560,10 +563,94 @@ func iptablesPath() string {
 	return "iptables" // 最后仍用原名，便于错误信息里体现
 }
 
+// 代理端口，与 xray 包一致，用于 iptables INPUT 放行（安全组开了但本机 iptables 可能拦入站）
+const portSOCKS = 16666
+const portHTTP = 16667
+
+// 策略路由用：打标 16666/16667 入站连接，回复包查 table 100 走原默认网关，避免走 WARP 导致源 IP 错、外网连代理断。
+const mainRouteTable = 100
+const proxyReplyFwmark = 1
+const mainRouteFileName = ".main_route"
+
+// SaveDefaultRoute 在连接 WARP 前执行，保存当前默认路由（via GW dev IFACE）到 logDir/.main_route，
+// 供 ConfigureIPTables 做策略路由：代理端口的回复包走原网卡，外网连 16666 不断。
+func SaveDefaultRoute(logDir string) error {
+	gw, iface, err := parseDefaultRouteFromShow()
+	if err != nil {
+		gw, iface, err = parseDefaultRouteFromGet()
+	}
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(logDir, mainRouteFileName)
+	body := gw + "\n" + iface + "\n"
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		return fmt.Errorf("写入 %s: %w", path, err)
+	}
+	return nil
+}
+
+func parseDefaultRouteFromShow() (gw, iface string, err error) {
+	out, err := exec.Command("ip", "route", "show", "default").CombinedOutput()
+	if err != nil || len(out) == 0 {
+		return "", "", fmt.Errorf("无法获取默认路由: %w", err)
+	}
+	line := strings.TrimSpace(string(bytes.Split(out, []byte("\n"))[0]))
+	viaRe := regexp.MustCompile(`via\s+(\S+)`)
+	devRe := regexp.MustCompile(`dev\s+(\S+)`)
+	via := viaRe.FindStringSubmatch(line)
+	dev := devRe.FindStringSubmatch(line)
+	if len(dev) < 2 {
+		return "", "", fmt.Errorf("无法解析 dev: %s", line)
+	}
+	iface = dev[1]
+	if len(via) >= 2 {
+		return via[1], iface, nil
+	}
+	// 无 via（如 default dev eth0），用 ip route get 取网关
+	return parseDefaultRouteFromGet()
+}
+
+func parseDefaultRouteFromGet() (gw, iface string, err error) {
+	out, err := exec.Command("ip", "route", "get", "8.8.8.8").CombinedOutput()
+	if err != nil || len(out) == 0 {
+		return "", "", fmt.Errorf("ip route get 8.8.8.8 失败: %w", err)
+	}
+	line := strings.TrimSpace(string(bytes.Split(out, []byte("\n"))[0]))
+	viaRe := regexp.MustCompile(`via\s+(\S+)`)
+	devRe := regexp.MustCompile(`dev\s+(\S+)`)
+	via := viaRe.FindStringSubmatch(line)
+	dev := devRe.FindStringSubmatch(line)
+	if len(dev) < 2 {
+		return "", "", fmt.Errorf("无法从 ip route get 解析: %s", line)
+	}
+	iface = dev[1]
+	if len(via) >= 2 {
+		return via[1], iface, nil
+	}
+	// 直连（无 via），table 100 需要 default；可写 0.0.0.0 表示本机直连，但 ip route add default via 0.0.0.0 可能无效
+	// 保守：要求必须有 via
+	return "", "", fmt.Errorf("未找到网关（via）: %s", line)
+}
+
+// readDefaultRoute 从 logDir/.main_route 读取保存的网关与网卡（一行网关、一行网卡）。
+func readDefaultRoute(logDir string) (gw, iface string, err error) {
+	path := filepath.Join(logDir, mainRouteFileName)
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", "", err
+	}
+	lines := strings.SplitN(strings.TrimSpace(string(b)), "\n", 2)
+	if len(lines) < 2 {
+		return "", "", fmt.Errorf("无效格式: %s", path)
+	}
+	return strings.TrimSpace(lines[0]), strings.TrimSpace(lines[1]), nil
+}
+
 // ConfigureIPTables 先清空 nat POSTROUTING 与 FORWARD 链，再添加与 vh-warp 一致的
-// NAT MASQUERADE 与 FORWARD 规则，使经指定 WARP 网卡出站的流量正确转发。任一 -A 规则失败即返回错误。
-// 注意：flush 阶段错误被忽略（如无权限时 -F 可能失败），仅 -A 阶段失败会返回错误。
-func ConfigureIPTables(iface string) error {
+// NAT MASQUERADE 与 FORWARD 规则，放行 16666/16667 入站；若有保存的默认路由则添加策略路由，
+// 使发往代理客户端的回复包走原网卡（table 100），避免走 WARP 导致外网连代理断。
+func ConfigureIPTables(iface string, logDir string) error {
 	ipt := iptablesPath()
 	flush := [][]string{
 		{ipt, "-t", "nat", "-F", "POSTROUTING"},
@@ -576,11 +663,40 @@ func ConfigureIPTables(iface string) error {
 		{ipt, "-t", "nat", "-A", "POSTROUTING", "-o", iface, "-j", "MASQUERADE"},
 		{ipt, "-A", "FORWARD", "-o", iface, "-j", "ACCEPT"},
 		{ipt, "-A", "FORWARD", "-i", iface, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"},
+		{ipt, "-I", "INPUT", "-p", "tcp", "--dport", fmt.Sprintf("%d", portSOCKS), "-j", "ACCEPT"},
+		{ipt, "-I", "INPUT", "-p", "tcp", "--dport", fmt.Sprintf("%d", portHTTP), "-j", "ACCEPT"},
 	}
 	for _, c := range critical {
 		if out, err := exec.Command(c[0], c[1:]...).CombinedOutput(); err != nil {
 			return fmt.Errorf("iptables %v 失败: %w, 输出: %s", c, err, out)
 		}
+	}
+	// 策略路由：对访问 16666/16667 的入站连接打 CONNMARK，回复包打 fwmark，查 table 100 走原网关
+	gw, mainIface, err := readDefaultRoute(logDir)
+	if err != nil {
+		return nil // 无保存的路由则只做上面规则，不报错
+	}
+	// 避免重复添加，先删再加（忽略删除错误）
+	_ = exec.Command("ip", "rule", "del", "fwmark", fmt.Sprintf("%d", proxyReplyFwmark), "table", fmt.Sprintf("%d", mainRouteTable)).Run()
+	_ = exec.Command("ip", "route", "flush", "table", fmt.Sprintf("%d", mainRouteTable)).Run()
+	// mangle: 入站 16666/16667 打 connmark
+	for _, port := range []int{portSOCKS, portHTTP} {
+		c := []string{ipt, "-t", "mangle", "-A", "INPUT", "-p", "tcp", "--dport", fmt.Sprintf("%d", port), "-j", "CONNMARK", "--set-mark", fmt.Sprintf("%d", proxyReplyFwmark)}
+		if out, e := exec.Command(c[0], c[1:]...).CombinedOutput(); e != nil {
+			return fmt.Errorf("iptables mangle INPUT: %w, 输出: %s", e, out)
+		}
+	}
+	// mangle: 出站包若属于已打标连接，则打 fwmark，以便 ip rule 选 table 100
+	c := []string{ipt, "-t", "mangle", "-A", "OUTPUT", "-m", "connmark", "--mark", fmt.Sprintf("%d", proxyReplyFwmark), "-j", "MARK", "--set-mark", fmt.Sprintf("%d", proxyReplyFwmark)}
+	if out, e := exec.Command(c[0], c[1:]...).CombinedOutput(); e != nil {
+		return fmt.Errorf("iptables mangle OUTPUT: %w, 输出: %s", e, out)
+	}
+	// 查 table 100 的包走原默认网关
+	if out, e := exec.Command("ip", "rule", "add", "fwmark", fmt.Sprintf("%d", proxyReplyFwmark), "table", fmt.Sprintf("%d", mainRouteTable)).CombinedOutput(); e != nil {
+		return fmt.Errorf("ip rule add: %w, 输出: %s", e, out)
+	}
+	if out, e := exec.Command("ip", "route", "add", "default", "via", gw, "dev", mainIface, "table", fmt.Sprintf("%d", mainRouteTable)).CombinedOutput(); e != nil {
+		return fmt.Errorf("ip route add table %d: %w, 输出: %s", mainRouteTable, e, out)
 	}
 	return nil
 }
@@ -636,5 +752,5 @@ func FullRestartWarp(logDir string) error {
 	if err := EnsureIPForward(); err != nil {
 		return err
 	}
-	return ConfigureIPTables(iface)
+	return ConfigureIPTables(iface, logDir)
 }
