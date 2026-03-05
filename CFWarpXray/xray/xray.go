@@ -9,6 +9,17 @@ import (
 
 	"CFWarpXray/internal/logger"
 	"github.com/xtls/xray-core/core"
+
+	// 注册 JSON 配置加载器，否则 StartInstance("json", config) 会报 Unable to load config in json
+	_ "github.com/xtls/xray-core/main/json"
+	// 注册 SOCKS/HTTP/freedom 等协议，供 JSON inbounds/outbounds 解析
+	_ "github.com/xtls/xray-core/app/dispatcher"
+	_ "github.com/xtls/xray-core/app/proxyman/inbound"
+	_ "github.com/xtls/xray-core/app/proxyman/outbound"
+	_ "github.com/xtls/xray-core/app/router"
+	_ "github.com/xtls/xray-core/proxy/freedom"
+	_ "github.com/xtls/xray-core/proxy/http"
+	_ "github.com/xtls/xray-core/proxy/socks"
 )
 
 const (

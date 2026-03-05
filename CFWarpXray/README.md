@@ -4,15 +4,31 @@
 
 ## 环境要求
 
-- Linux（Debian/Ubuntu 等），已安装 **cloudflare-warp**（warp-svc、warp-cli）
+- Linux（Debian/Ubuntu 等）；**cloudflare-warp**（warp-svc、warp-cli）若未安装，程序会在 Debian/Ubuntu 上尝试自动安装（需 root 与网络，可设 `WARP_XRAY_AUTO_INSTALL=0` 禁用）
 - 可选：`ip`、`iptables`、`dbus`、`pgrep`、`pkill`（与 vh-warp 一致）
-- 运行需 root 或具备相应权限（创建 TUN、配置 iptables）
+- 运行需 root 或具备相应权限（创建 TUN、配置 iptables、自动安装时执行 apt-get）
+
+## 资源与内存
+
+本方案**内存占用较高**，主要来自：
+
+| 组件 | 说明与大致占用 |
+|------|----------------|
+| **warp-svc** | Cloudflare 官方常驻进程，约 **150～400MB+**，连接/重连时可能更高 |
+| **Xray**（进程内） | 代理核心，约 **几十～一百多 MB**，随连接数增加 |
+| **本程序** | Go 进程本身，约 **几十 MB** |
+
+**2 核 2G 的机器**在同时跑系统、sshd 等时，很容易被 OOM 杀进程。建议：
+
+- **推荐**：至少 **2.5G～3G 内存**，或 **2G + 512MB～1G swap** 缓解；
+- 若必须用 2G：先加 swap（例如 `sudo fallocate -l 1G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile`），再跑本程序，并留意 `dmesg` 是否出现 OOM。
 
 ## 环境变量
 
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
 | `WARP_XRAY_LOG_DIR` | 日志目录（init.log、monitor.log、warp-svc.log） | `/var/log/warp-xray` |
+| `WARP_XRAY_AUTO_INSTALL` | 设为 `0` 时禁用自动安装 cloudflare-warp；未设置或非 0 时，若未检测到 warp-svc 会在 Debian/Ubuntu 上尝试 `apt-get install cloudflare-warp`（需 root 与网络） | 启用 |
 
 ## 代理端口
 
@@ -47,6 +63,7 @@ docker run -d --name cfwarpxray --cap-add=NET_ADMIN --cap-add=NET_RAW --cap-add=
 - warp-svc 自身输出：`warp-svc.log`
 - 未找到命令：确认已安装 cloudflare-warp 且 `warp-svc`、`warp-cli` 在 PATH 中
 - iptables 失败：确认有 NET_ADMIN 权限或容器已按上例加 cap
+- 代理无流量：程序会自动开启 `net.ipv4.ip_forward=1`（与 vh-warp 的 `--sysctl net.ipv4.ip_forward=1` 一致），若仍无流量请检查 iptables 与 WARP 网卡
 
 ## 与 vh-warp 的差异
 
@@ -56,3 +73,4 @@ docker run -d --name cfwarpxray --cap-add=NET_ADMIN --cap-add=NET_RAW --cap-add=
 | WARP | shell 脚本 + warp-svc/warp-cli | Go 内 exec 调用相同命令 |
 | 监控 | warp-monitor.sh + supervisor | Go 内 5 秒轮询 + 互斥串行 |
 | 入口 | init-warp.sh 后 supervisord | 单进程：init 后直接监控循环 |
+| 系统 | 镜像内预装 iptables、Docker 传 `ip_forward=1` | 可自动安装 iptables、程序内开启 ip_forward |

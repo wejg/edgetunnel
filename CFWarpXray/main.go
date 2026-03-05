@@ -36,6 +36,7 @@ func main() {
 	// 1. WARP 完整初始化：清理旧进程 → TUN → dbus → warp-svc → 注册/连接 → iptables
 	if err := warp.InitWarp(logDir); err != nil {
 		logger.Stderr(logger.LevelError, "main", fmt.Sprintf("WARP 初始化失败，退出: %v", err))
+		warp.Disconnect()
 		os.Exit(1)
 	}
 
@@ -43,6 +44,7 @@ func main() {
 	var runner xray.Runner
 	if err := runner.Start(nil); err != nil {
 		logger.Stderr(logger.LevelError, "main", fmt.Sprintf("Xray 启动失败，退出: %v", err))
+		warp.Disconnect()
 		os.Exit(1)
 	}
 	defer func() { _ = runner.Stop() }() // 进程退出（含 panic）时尽量关闭 Xray
@@ -69,7 +71,8 @@ func main() {
 	for {
 		select {
 		case <-sigCh:
-			logger.Stdout(logger.LevelInfo, "main", "收到退出信号，关闭 Xray 后退出")
+			logger.Stdout(logger.LevelInfo, "main", "收到退出信号，断开 WARP 并关闭 Xray 后退出")
+			warp.Disconnect()
 			_ = runner.Stop()
 			os.Exit(0)
 		case <-ticker.C:
