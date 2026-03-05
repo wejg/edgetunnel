@@ -43,6 +43,31 @@ go build -o cfwarpxray .
 ./cfwarpxray
 ```
 
+### 以 systemd 常驻运行
+
+复制二进制和 unit 文件后启用服务，断 SSH 也会继续跑：
+
+```bash
+# 1. 复制二进制（若用 /root/main 则跳过，并在下面步骤 3 里改服务文件中的路径）
+sudo cp cfwarpxray /usr/local/bin/
+
+# 2. 复制服务文件
+sudo cp cfwarpxray.service /etc/systemd/system/
+
+# 3. 若二进制在 /root/main，先改服务里的路径：
+#    sudo sed -i 's|/usr/local/bin/cfwarpxray|/root/main|' /etc/systemd/system/cfwarpxray.service
+
+# 4. 重载并启用、启动
+sudo systemctl daemon-reload
+sudo systemctl enable cfwarpxray
+sudo systemctl start cfwarpxray
+sudo systemctl status cfwarpxray
+```
+
+常用命令：`status` 查看状态，`stop` 停止，`restart` 重启；日志：`journalctl -u cfwarpxray -f`。
+
+可选环境变量可放在 `/etc/default/cfwarpxray`（如 `WARP_XRAY_LOG_DIR=/var/log/warp-xray`），服务会自动读取。
+
 ## Docker
 
 镜像需安装 cloudflare-warp，运行时需与 vh-warp 相同的权限（见 Dockerfile 顶部注释）：

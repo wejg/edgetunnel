@@ -1,5 +1,5 @@
 // Package xray 在进程内通过 xray-core 提供 SOCKS5/HTTP 代理（替代 vh-warp 中的 GOST），
-// 出口使用 freedom，走系统默认路由（即经 WARP 网卡出站）；与 vh-warp 暴露端口一致。
+// 出口走本机 WARP Local Proxy，避免全局默认路由被 WARP 接管带来的回包抖动。
 package xray
 
 import (
@@ -18,16 +18,20 @@ import (
 	_ "github.com/xtls/xray-core/app/proxyman/inbound"
 	_ "github.com/xtls/xray-core/app/proxyman/outbound"
 	_ "github.com/xtls/xray-core/app/router"
-	_ "github.com/xtls/xray-core/proxy/freedom"
 	_ "github.com/xtls/xray-core/proxy/http"
 	_ "github.com/xtls/xray-core/proxy/socks"
+	_ "github.com/xtls/xray-core/proxy/vless/inbound"
 )
 
 const (
-	// PortSOCKS SOCKS5 代理端口，与 vh-warp 一致
-	PortSOCKS = 16666
-	// PortHTTP HTTP 代理端口（Xray 无单端口 mixed，故与 SOCKS 分开）
+	// PortVLESS VLESS 入站端口（原 SOCKS 端口）
+	PortVLESS = 16666
+	// PortHTTP HTTP 代理端口（Xray 无单端口 mixed，故与 VLESS 分开）
 	PortHTTP = 16667
+	// WarpProxyPortDefault WARP Local Proxy 默认端口
+	WarpProxyPortDefault = 40000
+	// DefaultVLESSClientID 默认 VLESS 客户端 UUID，可通过环境变量等覆盖
+	DefaultVLESSClientID = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 )
 
 const componentXray = "xray"
@@ -46,14 +50,15 @@ type LogConfig struct {
 	Error    string `json:"error,omitempty"`
 }
 
-// InboundObject 对应 Xray 入站（listen、port、protocol、settings 等）。
+// InboundObject 对应 Xray 入站（listen、port、protocol、settings、streamSettings 等）。
 type InboundObject struct {
-	Listen   string      `json:"listen,omitempty"`
-	Port     json.Number `json:"port"`
-	Protocol string      `json:"protocol"`
-	Tag      string      `json:"tag,omitempty"`
-	Settings interface{} `json:"settings,omitempty"`
-	Sniffing *Sniffing   `json:"sniffing,omitempty"`
+	Listen         string      `json:"listen,omitempty"`
+	Port           json.Number `json:"port"`
+	Protocol       string      `json:"protocol"`
+	Tag            string      `json:"tag,omitempty"`
+	Settings       interface{} `json:"settings,omitempty"`
+	StreamSettings interface{} `json:"streamSettings,omitempty"`
+	Sniffing       *Sniffing   `json:"sniffing,omitempty"`
 }
 
 // Sniffing 入站嗅探配置；本程序未启用。
@@ -69,20 +74,29 @@ type OutboundObject struct {
 	Settings interface{} `json:"settings,omitempty"`
 }
 
-// BuildConfig 生成 Xray JSON 配置：0.0.0.0:16666 SOCKS、0.0.0.0:16667 HTTP，
+// BuildConfig 生成 Xray JSON 配置：0.0.0.0:16666 VLESS、0.0.0.0:16667 HTTP，
 // 出站为 freedom，domainStrategy AsIs。logLevel 非空时设置 log.loglevel（如 "warning"）；
 // logDir 非空时将 access/error 日志写入 logDir/xray-access.log、logDir/xray-error.log。
-func BuildConfig(logLevel, logDir string) ([]byte, error) {
+func BuildConfig(logLevel, logDir string, warpProxyPort int) ([]byte, error) {
 	cfg := Config{
 		Inbounds: []InboundObject{
 			{
 				Listen:   "0.0.0.0",
-				Port:     json.Number(fmt.Sprintf("%d", PortSOCKS)),
-				Protocol: "socks",
-				Tag:      "socks-in",
+				Port:     json.Number(fmt.Sprintf("%d", PortVLESS)),
+				Protocol: "vless",
+				Tag:      "vless-in",
 				Settings: map[string]interface{}{
-					"auth": "noauth",
-					"udp":  true,
+					"clients": []map[string]interface{}{
+						{
+							"id":    DefaultVLESSClientID,
+							"level": 0,
+							"email": "main@local",
+						},
+					},
+					"decryption": "none",
+				},
+				StreamSettings: map[string]interface{}{
+					"network": "tcp",
 				},
 			},
 			{
@@ -95,10 +109,15 @@ func BuildConfig(logLevel, logDir string) ([]byte, error) {
 		},
 		Outbounds: []OutboundObject{
 			{
-				Protocol: "freedom",
-				Tag:      "direct",
+				Protocol: "socks",
+				Tag:      "warp-proxy",
 				Settings: map[string]interface{}{
-					"domainStrategy": "AsIs",
+					"servers": []map[string]interface{}{
+						{
+							"address": "127.0.0.1",
+							"port":    warpProxyPort,
+						},
+					},
 				},
 			},
 		},
@@ -120,7 +139,7 @@ type Runner struct {
 	config   []byte
 }
 
-// Start 使用给定 JSON 配置启动 Xray；config 为 nil 时使用 BuildConfig("warning")。
+// Start 使用给定 JSON 配置启动 Xray；config 为 nil 时使用 BuildConfig("warning", "", 40000)。
 // 若已有 instance 且未在运行（异常退出或已 Close），会先置 nil 再启动新实例，避免悬空引用。
 func (r *Runner) Start(config []byte) error {
 	r.mu.Lock()
@@ -134,7 +153,7 @@ func (r *Runner) Start(config []byte) error {
 	}
 	if config == nil {
 		var err error
-		config, err = BuildConfig("warning", "")
+		config, err = BuildConfig("warning", "", WarpProxyPortDefault)
 		if err != nil {
 			return err
 		}
@@ -145,7 +164,7 @@ func (r *Runner) Start(config []byte) error {
 		return fmt.Errorf("xray StartInstance: %w", err)
 	}
 	r.instance = inst
-	logger.Stdout(logger.LevelInfo, componentXray, fmt.Sprintf("已启动，SOCKS %d / HTTP %d", PortSOCKS, PortHTTP))
+	logger.Stdout(logger.LevelInfo, componentXray, fmt.Sprintf("已启动，VLESS %d / HTTP %d", PortVLESS, PortHTTP))
 	return nil
 }
 
@@ -167,7 +186,7 @@ func (r *Runner) Restart() error {
 	cfg := r.config
 	if cfg == nil {
 		var err error
-		cfg, err = BuildConfig("warning", "")
+		cfg, err = BuildConfig("warning", "", WarpProxyPortDefault)
 		if err != nil {
 			return err
 		}

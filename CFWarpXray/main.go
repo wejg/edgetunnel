@@ -1,5 +1,5 @@
 // CFWarpXray 复刻 vh-warp 逻辑：WARP 通过命令行（warp-svc/warp-cli）初始化与自愈，
-// 代理由进程内 Xray（SOCKS 16666 + HTTP 16667）提供，出口经系统路由走 WARP。
+// 代理由进程内 Xray（VLESS 16666 + HTTP 16667）提供，出口经系统路由走 WARP。
 package main
 
 import (
@@ -33,19 +33,20 @@ func main() {
 		logDir = defaultLogDir
 	}
 
-	// 1. WARP 完整初始化：清理旧进程 → TUN → dbus → warp-svc → 注册/连接 → iptables
+	// 1. WARP 完整初始化：清理旧进程 → TUN → dbus → warp-svc → 注册/连接 → proxy mode
 	if err := warp.InitWarp(logDir); err != nil {
 		logger.Stderr(logger.LevelError, "main", fmt.Sprintf("WARP 初始化失败，退出: %v", err))
 		warp.Disconnect()
 		os.Exit(1)
 	}
 
-	// 2. 启动 Xray 代理（SOCKS 16666 + HTTP 16667，出口 freedom 走 WARP；日志写入 logDir）
+	// 2. 启动 Xray 代理（VLESS 16666 + HTTP 16667，出口经 WARP Local Proxy；日志写入 logDir）
 	xrayLogLevel := os.Getenv("WARP_XRAY_LOG_LEVEL")
 	if xrayLogLevel == "" {
 		xrayLogLevel = "info"
 	}
-	xrayConfig, err := xray.BuildConfig(xrayLogLevel, logDir)
+	// 直接监听 16666(VLESS)/16667(HTTP)，对外提供代理；出站走 WARP Local Proxy（默认 127.0.0.1:40000）
+	xrayConfig, err := xray.BuildConfig(xrayLogLevel, logDir, warp.WarpProxyPort())
 	if err != nil {
 		logger.Stderr(logger.LevelError, "main", fmt.Sprintf("生成 Xray 配置失败: %v", err))
 		warp.Disconnect()
@@ -65,7 +66,7 @@ func main() {
 	defer func() { _ = runner.Stop() }() // 进程退出（含 panic）时尽量关闭 Xray
 
 	logger.Stdout(logger.LevelInfo, "main",
-		fmt.Sprintf("服务就绪，代理端口 SOCKS %d / HTTP %d，日志目录 %s", xray.PortSOCKS, xray.PortHTTP, logDir))
+		fmt.Sprintf("服务就绪，代理端口 VLESS %d / HTTP %d（WARP proxy mode），日志目录 %s", xray.PortVLESS, xray.PortHTTP, logDir))
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -138,6 +139,9 @@ func runMonitor(logDir, monitorLog string, runner *xray.Runner, xrayConfig []byt
 	}
 	if !warp.IsConnected() {
 		logger.ToFileOnly(monitorLog, logger.LevelWarn, "main", "WARP 已断开，尝试重连并重启 Xray")
+		if err := warp.EnsureWarpProxyMode(nil); err != nil {
+			logger.ToFileOnly(monitorLog, logger.LevelWarn, "main", "重置 WARP proxy 模式失败: "+err.Error())
+		}
 		if err := warp.ReconnectWarp(); err != nil {
 			logger.ToFileOnly(monitorLog, logger.LevelWarn, "main", "重连失败，触发全流程重启: "+err.Error())
 			_ = runner.Stop()
@@ -146,7 +150,7 @@ func runMonitor(logDir, monitorLog string, runner *xray.Runner, xrayConfig []byt
 				if startErr := runner.Start(xrayConfig); startErr != nil {
 					logger.ToFileOnly(monitorLog, logger.LevelError, "main", "部分恢复 Xray 失败: "+startErr.Error())
 				} else {
-					logger.ToFileOnly(monitorLog, logger.LevelWarn, "main", "已尝试部分恢复 Xray，请检查 WARP/iptables 状态")
+					logger.ToFileOnly(monitorLog, logger.LevelWarn, "main", "已尝试部分恢复 Xray，请检查 WARP proxy 状态")
 				}
 				return
 			}

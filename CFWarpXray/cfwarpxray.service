@@ -1,0 +1,22 @@
+[Unit]
+Description=CFWarpXray - WARP + Xray proxy (VLESS/HTTP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 二进制路径：若你放在 /root/main，改为 ExecStart=/root/main
+ExecStart=/usr/local/bin/cfwarpxray
+Restart=on-failure
+RestartSec=10
+
+# 需 root 权限（WARP TUN、warp-svc 等）
+# 可选：从文件读环境变量（WARP_XRAY_LOG_DIR、WARP_XRAY_LOG_LEVEL 等）
+EnvironmentFile=-/etc/default/cfwarpxray
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cfwarpxray
+
+[Install]
+WantedBy=multi-user.target
