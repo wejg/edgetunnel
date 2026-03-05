@@ -1,0 +1,34 @@
+# Clash Verge / mihomo 用 — 直接复制到 proxies 里，或「从剪贴板导入」选 YAML
+# 先试域名，连不上再试 IP 那段（两段二选一）
+proxies:
+  # 方式一：用域名（推荐，SNI/Host 不会错）
+  - name: "xiaomaomao-域名"
+    type: vless
+    server: xiaomaomao.us.ci
+    port: 443
+    uuid: a8f59679-fa3d-4759-8913-c314a949714e
+    network: ws
+    tls: true
+    servername: xiaomaomao.us.ci
+    client-fingerprint: chrome
+    skip-cert-verify: false
+    ws-opts:
+      path: /
+      headers:
+        Host: xiaomaomao.us.ci
+
+  # 方式二：用 IP（必须保留 servername 和 Host，否则 CF 不认）
+  - name: "xiaomaomao-IP"
+    type: vless
+    server: 172.67.153.220
+    port: 443
+    uuid: a8f59679-fa3d-4759-8913-c314a949714e
+    network: ws
+    tls: true
+    servername: xiaomaomao.us.ci
+    client-fingerprint: chrome
+    skip-cert-verify: false
+    ws-opts:
+      path: /
+      headers:
+        Host: xiaomaomao.us.ci
