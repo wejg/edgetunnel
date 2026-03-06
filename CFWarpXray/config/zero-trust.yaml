@@ -1,0 +1,7 @@
+enabled: true
+organization: "xiaomaotaosu"
+auth_client_id: "bc4e35032fcecb2ab5910033d6dde27c.access"
+auth_client_secret: "6008c1eb8b7be23b4316a4af02a8a8317b4cdb9eb1d9b056061df7489a378bd0"
+service_mode: "proxy"
+proxy_port: 40000
+auto_connect: 1

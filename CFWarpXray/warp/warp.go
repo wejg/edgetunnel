@@ -40,6 +40,8 @@ const (
 	RegistrationNewRetrySleep = 10 * time.Second
 	// WarpCliPostReadyWait warp-cli 就绪后额外等待时间，再执行 registration（避免 daemon 未完全就绪导致 IPC 超时）
 	WarpCliPostReadyWait = 8 * time.Second
+	// ConnectProgressLogInterval 轮询 Connected 时进度日志的最短间隔，避免刷屏
+	ConnectProgressLogInterval = 15 * time.Second
 )
 
 const componentWarp = "warp"
@@ -75,6 +77,13 @@ func InitWarp(logDir string) error {
 	if err := ensureWarpInstalled(initLog, logInfo); err != nil {
 		return fmt.Errorf("启动 warp-svc: %w", err)
 	}
+	ztCfg, err := ApplyZeroTrustConfig(logInfo)
+	if err != nil {
+		return fmt.Errorf("加载 Zero Trust 配置: %w", err)
+	}
+	logInfo(fmt.Sprintf("Zero Trust 已启用：organization=%s, service_mode=%s, proxy_port=%d",
+		ztCfg.Organization, ztCfg.ServiceMode, ztCfg.ProxyPort))
+	logInfo("  → MDM 已写入 /var/lib/cloudflare-warp/mdm.xml，warp-svc 启动后将据此向 Zero Trust 注册")
 	warpSvcLog := filepath.Join(logDir, "warp-svc.log")
 	if err := StartWarpSvc(warpSvcLog); err != nil {
 		return fmt.Errorf("启动 warp-svc: %w", err)
@@ -87,11 +96,11 @@ func InitWarp(logDir string) error {
 	logInfo("warp-cli 可用")
 	time.Sleep(WarpCliPostReadyWait)
 
-	logInfo("[步骤] 检查/注册设备（registration show → 若无则 registration new）...")
-	if err := RegisterIfNeeded(logInfo); err != nil {
+	logInfo("[步骤] 检查 Zero Trust 设备注册状态...")
+	if err := RegisterIfNeeded(logInfo, false); err != nil {
 		return fmt.Errorf("注册/检查设备: %w", err)
 	}
-	logInfo("[步骤] 设备已注册")
+	logInfo("[步骤] Zero Trust 注册状态检查完成")
 
 	if err := EnsureWarpProxyMode(logInfo); err != nil {
 		return fmt.Errorf("切换 WARP Proxy 模式: %w", err)
@@ -345,7 +354,7 @@ func WarpCliReady(timeout time.Duration) error {
 }
 
 // RegisterIfNeeded 检查并按需注册 WARP 设备。
-func RegisterIfNeeded(logStep func(string)) error {
+func RegisterIfNeeded(logStep func(string), allowInteractive bool) error {
 	if logStep != nil {
 		logStep("  → 执行 warp-cli registration show")
 	}
@@ -353,9 +362,21 @@ func RegisterIfNeeded(logStep func(string)) error {
 	if err != nil && errors.Is(err, exec.ErrNotFound) {
 		return wrapCmdErr("warp-cli registration show", err)
 	}
+	if logStep != nil {
+		summary := firstLine(bytes.TrimSpace(out))
+		if summary != "" {
+			logStep("  → registration show: " + summary)
+		}
+	}
 	if err == nil && bytes.Contains(out, []byte("Device ID")) {
 		if logStep != nil {
-			logStep("  → 已有 Device ID，跳过注册")
+			logStep("  → 已有 Device ID，已加入 Zero Trust 组织")
+		}
+		return nil
+	}
+	if !allowInteractive {
+		if logStep != nil {
+			logStep("  → 当前无 Device ID；首次 connect 时将由 Service Token 完成注册（请确认后台 Device enrollment 已添加 Service Auth）")
 		}
 		return nil
 	}
@@ -421,20 +442,25 @@ func ConnectWarp(timeout time.Duration, logProgress func(string)) error {
 		return wrapCmdErr("warp-cli connect", err)
 	}
 	deadline := time.Now().Add(timeout)
+	var lastLog time.Time
 	for time.Now().Before(deadline) {
 		out, err := exec.Command("warp-cli", "--accept-tos", "status").CombinedOutput()
 		if err == nil && bytes.Contains(out, []byte("Connected")) {
 			return nil
 		}
 		if logProgress != nil {
-			status := firstLine(bytes.TrimSpace(out))
-			if status != "" {
-				logProgress("  等待 WARP Connected，当前: " + status)
+			now := time.Now()
+			if now.Sub(lastLog) >= ConnectProgressLogInterval {
+				status := firstLine(bytes.TrimSpace(out))
+				if status != "" {
+					logProgress("  等待 WARP Connected，当前: " + status)
+				}
+				lastLog = now
 			}
 		}
 		time.Sleep(WarpCliPollInterval)
 	}
-	return fmt.Errorf("WARP 在 %v 内未连接", timeout)
+	return fmt.Errorf("WARP 在 %v 内未连接（请检查 Zero Trust 后台 Device enrollment 是否已添加 Service Auth、Token 是否有效；可执行 warp-cli registration show 与 warp-cli status 排查）", timeout)
 }
 
 // IsConnected 判断当前 WARP 是否处于 Connected。
