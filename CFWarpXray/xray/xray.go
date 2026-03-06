@@ -13,8 +13,9 @@ import (
 
 	// 注册 JSON 配置加载器，否则 StartInstance("json", config) 会报 Unable to load config in json
 	_ "github.com/xtls/xray-core/main/json"
-	// 注册 SOCKS/HTTP/freedom 等协议，供 JSON inbounds/outbounds 解析
+	// 注册 DNS/SOCKS/HTTP/freedom 等协议，供 JSON 配置解析
 	_ "github.com/xtls/xray-core/app/dispatcher"
+	_ "github.com/xtls/xray-core/app/dns"
 	_ "github.com/xtls/xray-core/app/proxyman/inbound"
 	_ "github.com/xtls/xray-core/app/proxyman/outbound"
 	_ "github.com/xtls/xray-core/app/router"
@@ -39,6 +40,8 @@ const componentXray = "xray"
 // Config 为 Xray 的 JSON 配置结构，仅包含本程序用到的字段（log、inbounds、outbounds）。
 type Config struct {
 	Log       *LogConfig       `json:"log,omitempty"`
+	DNS       interface{}      `json:"dns,omitempty"`
+	Routing   interface{}      `json:"routing,omitempty"`
 	Inbounds  []InboundObject  `json:"inbounds"`
 	Outbounds []OutboundObject `json:"outbounds"`
 }
@@ -75,10 +78,22 @@ type OutboundObject struct {
 }
 
 // BuildConfig 生成 Xray JSON 配置：0.0.0.0:16666 VLESS、0.0.0.0:16667 HTTP，
-// 出站为 freedom，domainStrategy AsIs。logLevel 非空时设置 log.loglevel（如 "warning"）；
+// 出站走本机 WARP SOCKS5，并启用 DoH DNS（降低本机 DNS 污染影响）。
+// logLevel 非空时设置 log.loglevel（如 "warning"）；
 // logDir 非空时将 access/error 日志写入 logDir/xray-access.log、logDir/xray-error.log。
 func BuildConfig(logLevel, logDir string, warpProxyPort int) ([]byte, error) {
 	cfg := Config{
+		DNS: map[string]interface{}{
+			"queryStrategy": "UseIPv4",
+			"servers": []interface{}{
+				map[string]interface{}{"address": "https+local://1.1.1.1/dns-query"},
+				map[string]interface{}{"address": "https+local://8.8.8.8/dns-query"},
+				"localhost",
+			},
+		},
+		Routing: map[string]interface{}{
+			"domainStrategy": "IPIfNonMatch",
+		},
 		Inbounds: []InboundObject{
 			{
 				Listen:   "0.0.0.0",

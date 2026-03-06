@@ -150,6 +150,12 @@ func EnsureWarpProxyMode(logInfo func(string)) error {
 			modeOK = true
 			break
 		}
+		if isManagedPolicyDenied(out) {
+			if logInfo != nil {
+				logInfo("  → 设备受 Zero Trust 策略托管，跳过本地 mode 切换")
+			}
+			return nil
+		}
 		modeErrs = append(modeErrs, fmt.Sprintf("%s: %v (%s)", c.name, err, strings.TrimSpace(string(out))))
 	}
 	if !modeOK {
@@ -172,6 +178,11 @@ func EnsureWarpProxyMode(logInfo func(string)) error {
 		if out, err := exec.Command("warp-cli", c.args...).CombinedOutput(); err == nil {
 			portOK = true
 			break
+		} else if isManagedPolicyDenied(out) {
+			if logInfo != nil {
+				logInfo("  → 设备受 Zero Trust 策略托管，跳过本地 proxy 端口设置")
+			}
+			return nil
 		} else if logInfo != nil {
 			logInfo("  → " + c.name + " 失败: " + strings.TrimSpace(string(out)))
 		}
@@ -186,6 +197,11 @@ func EnsureWarpProxyMode(logInfo func(string)) error {
 		return fmt.Errorf("设置 WARP proxy 端口失败，且当前端口非默认值 %d", port)
 	}
 	return nil
+}
+
+func isManagedPolicyDenied(out []byte) bool {
+	s := strings.ToLower(string(out))
+	return strings.Contains(s, "operation not authorized in this context")
 }
 
 // ensureWarpInstalled 若 PATH 中无 warp-svc，则尝试安装 cloudflare-warp（仅 Debian/Ubuntu）。
