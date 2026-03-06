@@ -11,7 +11,7 @@ docker run -d --name cfwarpxray \
 
   docker run -d --name cfwarpxray \
     --dns 1.1.1.1 \
-    --dns 1.0.0.1 \
+    --dns 8.8.8.8 \
     --cap-add=NET_ADMIN --cap-add=NET_RAW --cap-add=MKNOD \
     --device-cgroup-rule 'c 10:200 rwm' \
     -p 16666:16666 -p 16667:16667 \

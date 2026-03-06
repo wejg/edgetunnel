@@ -77,11 +77,11 @@ type OutboundObject struct {
 	Settings interface{} `json:"settings,omitempty"`
 }
 
-// BuildConfig 生成 Xray JSON 配置：0.0.0.0:16666 VLESS、0.0.0.0:16667 HTTP，
+// BuildConfigProxy 生成 Xray JSON 配置：0.0.0.0:16666 VLESS、0.0.0.0:16667 HTTP，
 // 出站走本机 WARP SOCKS5，并启用 DoH DNS（降低本机 DNS 污染影响）。
 // logLevel 非空时设置 log.loglevel（如 "warning"）；
 // logDir 非空时将 access/error 日志写入 logDir/xray-access.log、logDir/xray-error.log。
-func BuildConfig(logLevel, logDir string, warpProxyPort int) ([]byte, error) {
+func BuildConfigProxy(logLevel, logDir string, warpProxyPort int) ([]byte, error) {
 	cfg := Config{
 		DNS: map[string]interface{}{
 			"queryStrategy": "UseIPv4",
@@ -145,6 +145,74 @@ func BuildConfig(logLevel, logDir string, warpProxyPort int) ([]byte, error) {
 		}
 	}
 	return json.MarshalIndent(cfg, "", "  ")
+}
+
+// BuildConfigDirect 生成 Xray JSON 配置：0.0.0.0:16666 VLESS、0.0.0.0:16667 HTTP，
+// 出站直连（freedom），适用于 WARP TUN 全局模式已接管系统路由的情况。
+// logLevel 非空时设置 log.loglevel（如 "warning"）；
+// logDir 非空时将 access/error 日志写入 logDir/xray-access.log、logDir/xray-error.log。
+func BuildConfigDirect(logLevel, logDir string) ([]byte, error) {
+	cfg := Config{
+		DNS: map[string]interface{}{
+			"queryStrategy": "UseIPv4",
+			"servers": []interface{}{
+				map[string]interface{}{"address": "https+local://1.1.1.1/dns-query"},
+				map[string]interface{}{"address": "https+local://8.8.8.8/dns-query"},
+				"localhost",
+			},
+		},
+		Routing: map[string]interface{}{
+			"domainStrategy": "IPIfNonMatch",
+		},
+		Inbounds: []InboundObject{
+			{
+				Listen:   "0.0.0.0",
+				Port:     json.Number(fmt.Sprintf("%d", PortVLESS)),
+				Protocol: "vless",
+				Tag:      "vless-in",
+				Settings: map[string]interface{}{
+					"clients": []map[string]interface{}{
+						{
+							"id":    DefaultVLESSClientID,
+							"level": 0,
+							"email": "main@local",
+						},
+					},
+					"decryption": "none",
+				},
+				StreamSettings: map[string]interface{}{
+					"network": "tcp",
+				},
+			},
+			{
+				Listen:   "0.0.0.0",
+				Port:     json.Number(fmt.Sprintf("%d", PortHTTP)),
+				Protocol: "http",
+				Tag:      "http-in",
+				Settings: map[string]interface{}{},
+			},
+		},
+		Outbounds: []OutboundObject{
+			{
+				Protocol: "freedom",
+				Tag:      "direct",
+				Settings: map[string]interface{}{},
+			},
+		},
+	}
+	if logLevel != "" || logDir != "" {
+		cfg.Log = &LogConfig{Loglevel: logLevel}
+		if logDir != "" {
+			cfg.Log.Access = filepath.Join(logDir, "xray-access.log")
+			cfg.Log.Error = filepath.Join(logDir, "xray-error.log")
+		}
+	}
+	return json.MarshalIndent(cfg, "", "  ")
+}
+
+// BuildConfig 兼容性函数，默认使用 proxy 模式。
+func BuildConfig(logLevel, logDir string, warpProxyPort int) ([]byte, error) {
+	return BuildConfigProxy(logLevel, logDir, warpProxyPort)
 }
 
 // Runner 持有当前 Xray 实例与配置，提供 Start/Stop/Restart，供 main 启动与监控循环重启用。

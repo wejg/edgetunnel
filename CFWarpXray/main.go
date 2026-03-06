@@ -33,20 +33,28 @@ func main() {
 		logDir = defaultLogDir
 	}
 
-	// 1. WARP 完整初始化：清理旧进程 → TUN → dbus → warp-svc → 注册/连接 → proxy mode
-	if err := warp.InitWarp(logDir); err != nil {
+	// 1. WARP 完整初始化：清理旧进程 → TUN → dbus → warp-svc → 注册/连接 → proxy mode 或 TUN mode
+	ztCfg, err := warp.InitWarpWithConfig(logDir)
+	if err != nil {
 		logger.Stderr(logger.LevelError, "main", fmt.Sprintf("WARP 初始化失败，退出: %v", err))
 		warp.Disconnect()
 		os.Exit(1)
 	}
 
-	// 2. 启动 Xray 代理（VLESS 16666 + HTTP 16667，出口经 WARP Local Proxy；日志写入 logDir）
+	// 2. 启动 Xray 代理（VLESS 16666 + HTTP 16667，出口根据 WARP 模式决定；日志写入 logDir）
 	xrayLogLevel := os.Getenv("WARP_XRAY_LOG_LEVEL")
 	if xrayLogLevel == "" {
 		xrayLogLevel = "info"
 	}
-	// 直接监听 16666(VLESS)/16667(HTTP)，对外提供代理；出站走 WARP Local Proxy（默认 127.0.0.1:40000）
-	xrayConfig, err := xray.BuildConfig(xrayLogLevel, logDir, warp.WarpProxyPort())
+	// 根据 WARP 模式决定 Xray 出站配置：
+	// - proxy 模式：出站走 WARP Local Proxy（默认 127.0.0.1:40000）
+	// - tun 模式：出站直连（freedom），因为 WARP 已接管全局路由
+	var xrayConfig []byte
+	if ztCfg.ServiceMode == "proxy" {
+		xrayConfig, err = xray.BuildConfigProxy(xrayLogLevel, logDir, warp.WarpProxyPort())
+	} else {
+		xrayConfig, err = xray.BuildConfigDirect(xrayLogLevel, logDir)
+	}
 	if err != nil {
 		logger.Stderr(logger.LevelError, "main", fmt.Sprintf("生成 Xray 配置失败: %v", err))
 		warp.Disconnect()
@@ -139,8 +147,9 @@ func runMonitor(logDir, monitorLog string, runner *xray.Runner, xrayConfig []byt
 	}
 	if !warp.IsConnected() {
 		logger.ToFileOnly(monitorLog, logger.LevelWarn, "main", "WARP 已断开，尝试重连并重启 Xray")
-		if err := warp.EnsureWarpProxyMode(nil); err != nil {
-			logger.ToFileOnly(monitorLog, logger.LevelWarn, "main", "重置 WARP proxy 模式失败: "+err.Error())
+		currentMode := warp.GetCurrentWarpMode()
+		if err := warp.EnsureWarpMode(currentMode, nil); err != nil {
+			logger.ToFileOnly(monitorLog, logger.LevelWarn, "main", fmt.Sprintf("重置 WARP %s 模式失败: %s", currentMode, err.Error()))
 		}
 		if err := warp.ReconnectWarp(); err != nil {
 			logger.ToFileOnly(monitorLog, logger.LevelWarn, "main", "重连失败，触发全流程重启: "+err.Error())

@@ -19,6 +19,9 @@ import (
 // env 用于测试时替换；生产环境为 os.Getenv
 var getEnv = os.Getenv
 
+// currentZeroTrustConfig 存储当前加载的 Zero Trust 配置，用于监控逻辑获取模式
+var currentZeroTrustConfig *ZeroTrustConfig
+
 const (
 	// WarpSvcStartWait warp-svc 启动后等待其就绪的时间（官方推荐）
 	WarpSvcStartWait = 3 * time.Second
@@ -51,11 +54,17 @@ const componentWarp = "warp"
 // logDir 为日志目录，用于 warp-svc.log、init.log 等（如 /var/log/warp-xray）；空字符串时使用当前目录 "."。
 // 返回 nil 表示全部步骤成功，否则返回包含步骤信息的错误。
 func InitWarp(logDir string) error {
+	_, err := InitWarpWithConfig(logDir)
+	return err
+}
+
+// InitWarpWithConfig 执行完整初始化流程并返回 Zero Trust 配置，用于确定 WARP 运行模式。
+func InitWarpWithConfig(logDir string) (*ZeroTrustConfig, error) {
 	if logDir == "" {
 		logDir = "."
 	}
 	if err := os.MkdirAll(logDir, 0755); err != nil {
-		return fmt.Errorf("创建日志目录 %s: %w", logDir, err)
+		return nil, fmt.Errorf("创建日志目录 %s: %w", logDir, err)
 	}
 	initLog := filepath.Join(logDir, "init.log")
 	logInfo := func(msg string) { logger.ToFile(initLog, logger.LevelInfo, componentWarp, msg) }
@@ -65,56 +74,72 @@ func InitWarp(logDir string) error {
 	logInfo("初始化环境")
 
 	if err := EnsureTUN(); err != nil {
-		return fmt.Errorf("准备 TUN 设备: %w", err)
+		return nil, fmt.Errorf("准备 TUN 设备: %w", err)
 	}
 	logInfo("TUN 设备就绪")
 
 	if err := EnsureDbus(); err != nil {
-		return fmt.Errorf("启动 dbus: %w", err)
+		return nil, fmt.Errorf("启动 dbus: %w", err)
 	}
 	logInfo("dbus 就绪")
 
 	if err := ensureWarpInstalled(initLog, logInfo); err != nil {
-		return fmt.Errorf("启动 warp-svc: %w", err)
+		return nil, fmt.Errorf("启动 warp-svc: %w", err)
 	}
 	ztCfg, err := ApplyZeroTrustConfig(logInfo)
 	if err != nil {
-		return fmt.Errorf("加载 Zero Trust 配置: %w", err)
+		return nil, fmt.Errorf("加载 Zero Trust 配置: %w", err)
 	}
 	logInfo(fmt.Sprintf("Zero Trust 已启用：organization=%s, service_mode=%s, proxy_port=%d",
 		ztCfg.Organization, ztCfg.ServiceMode, ztCfg.ProxyPort))
 	logInfo("  → MDM 已写入 /var/lib/cloudflare-warp/mdm.xml，warp-svc 启动后将据此向 Zero Trust 注册")
 	warpSvcLog := filepath.Join(logDir, "warp-svc.log")
 	if err := StartWarpSvc(warpSvcLog); err != nil {
-		return fmt.Errorf("启动 warp-svc: %w", err)
+		return nil, fmt.Errorf("启动 warp-svc: %w", err)
 	}
 	logInfo("warp-svc 已启动")
 
 	if err := WarpCliReady(WarpCliReadyTimeout); err != nil {
-		return fmt.Errorf("等待 warp-cli 就绪: %w", err)
+		return nil, fmt.Errorf("等待 warp-cli 就绪: %w", err)
 	}
 	logInfo("warp-cli 可用")
 	time.Sleep(WarpCliPostReadyWait)
 
 	logInfo("[步骤] 检查 Zero Trust 设备注册状态...")
 	if err := RegisterIfNeeded(logInfo, false); err != nil {
-		return fmt.Errorf("注册/检查设备: %w", err)
+		return nil, fmt.Errorf("注册/检查设备: %w", err)
 	}
 	logInfo("[步骤] Zero Trust 注册状态检查完成")
 
-	if err := EnsureWarpProxyMode(logInfo); err != nil {
-		return fmt.Errorf("切换 WARP Proxy 模式: %w", err)
+	// 根据配置的 service_mode 设置 WARP 模式
+	var isProxyMode bool
+	if ztCfg.ServiceMode == "proxy" {
+		if err := EnsureWarpProxyMode(logInfo); err != nil {
+			return nil, fmt.Errorf("切换 WARP Proxy 模式: %w", err)
+		}
+		logInfo("WARP Proxy 模式已启用")
+		isProxyMode = true
+	} else {
+		if err := EnsureWarpTunMode(logInfo); err != nil {
+			return nil, fmt.Errorf("切换 WARP TUN 模式: %w", err)
+		}
+		logInfo("WARP TUN 全局模式已启用")
+		isProxyMode = false
 	}
-	logInfo("WARP Proxy 模式已启用")
 	logInfo("[步骤] 开始连接 WARP（轮询 status 等待 Connected，最多 3 分钟）...")
 	if err := ConnectWarp(ConnectPollTimeout, logInfo); err != nil {
-		return fmt.Errorf("连接 WARP: %w", err)
+		return nil, fmt.Errorf("连接 WARP: %w", err)
 	}
 	logInfo("WARP 已连接")
-	logInfo("Proxy 模式无需配置全局路由/iptables 策略")
+	if isProxyMode {
+		logInfo("Proxy 模式无需配置全局路由/iptables 策略")
+	} else {
+		logInfo("TUN 全局模式已接管系统默认路由")
+	}
 	logInfo("========================================")
 	logInfo("WARP 初始化完成")
-	return nil
+	currentZeroTrustConfig = ztCfg
+	return ztCfg, nil
 }
 
 // WarpProxyPort 返回期望的 WARP Local Proxy 端口，支持环境变量 WARP_XRAY_WARP_PROXY_PORT 覆盖。
@@ -127,6 +152,40 @@ func WarpProxyPort() int {
 		return p
 	}
 	return WarpProxyPortDefault
+}
+
+// EnsureWarpTunMode 设置 WARP 为 TUN 全局模式。
+func EnsureWarpTunMode(logInfo func(string)) error {
+	modeCandidates := []struct {
+		name string
+		args []string
+	}{
+		{name: "set-mode warp", args: []string{"--accept-tos", "set-mode", "warp"}},
+		{name: "mode warp", args: []string{"--accept-tos", "mode", "warp"}},
+	}
+	var modeOK bool
+	var modeErrs []string
+	for _, c := range modeCandidates {
+		if logInfo != nil {
+			logInfo("  → 尝试 warp-cli " + c.name)
+		}
+		out, err := exec.Command("warp-cli", c.args...).CombinedOutput()
+		if err == nil {
+			modeOK = true
+			break
+		}
+		if isManagedPolicyDenied(out) {
+			if logInfo != nil {
+				logInfo("  → 设备受 Zero Trust 策略托管，跳过本地 mode 切换")
+			}
+			return nil
+		}
+		modeErrs = append(modeErrs, fmt.Sprintf("%s: %v (%s)", c.name, err, strings.TrimSpace(string(out))))
+	}
+	if !modeOK {
+		return fmt.Errorf("设置 WARP tun mode 失败（命令兼容尝试均失败）: %s", strings.Join(modeErrs, " | "))
+	}
+	return nil
 }
 
 // EnsureWarpProxyMode 设置 WARP 为 proxy 模式，并尽力设置代理端口。
@@ -508,6 +567,23 @@ func Disconnect() {
 	_ = exec.Command("warp-cli", "--accept-tos", "disconnect").Run()
 }
 
+// GetCurrentWarpMode 返回当前配置的 WARP 模式（"proxy" 或其他）。
+func GetCurrentWarpMode() string {
+	if currentZeroTrustConfig != nil {
+		return currentZeroTrustConfig.ServiceMode
+	}
+	return "proxy" // 默认值
+}
+
+// EnsureWarpMode 根据指定模式设置 WARP（用于监控自愈）。
+func EnsureWarpMode(mode string, logInfo func(string)) error {
+	if mode == "proxy" {
+		return EnsureWarpProxyMode(logInfo)
+	} else {
+		return EnsureWarpTunMode(logInfo)
+	}
+}
+
 // FullRestartWarp 执行全流程重启：CleanOldProcess → EnsureDbus → StartWarpSvc →
 // WarpCliReady → set-mode proxy → ConnectWarp。logDir 为空时使用 "."。
 func FullRestartWarp(logDir string) error {
@@ -531,7 +607,8 @@ func FullRestartWarp(logDir string) error {
 	if err := WarpCliReady(WarpCliReadyTimeout); err != nil {
 		return err
 	}
-	if err := EnsureWarpProxyMode(nil); err != nil {
+	currentMode := GetCurrentWarpMode()
+	if err := EnsureWarpMode(currentMode, nil); err != nil {
 		return err
 	}
 	if err := ConnectWarp(ConnectPollTimeout, nil); err != nil {

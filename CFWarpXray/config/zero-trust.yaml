@@ -1,7 +1,16 @@
+# Zero Trust 配置示例
 enabled: true
 organization: "xiaomaotaosu"
 auth_client_id: "bc4e35032fcecb2ab5910033d6dde27c.access"
 auth_client_secret: "6008c1eb8b7be23b4316a4af02a8a8317b4cdb9eb1d9b056061df7489a378bd0"
+
+# WARP 运行模式：
+# - "proxy": 代理模式（推荐），WARP 提供本地 SOCKS5 代理，Xray 通过代理出站
+# - "warp" 或其他: TUN 全局模式，WARP 接管系统默认路由，Xray 直连出站
 service_mode: "proxy"
+
+# 代理模式下的本地代理端口（service_mode 为 "proxy" 时生效）
 proxy_port: 40000
+
+# 自动连接（1=启用，0=禁用）
 auto_connect: 1
