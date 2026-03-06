@@ -1,6 +1,6 @@
 # 运行时需 cap: NET_ADMIN, NET_RAW, MKNOD 及 device cgroup (c 10:200)，与 vh-warp 一致
 # Build stage
-FROM golang:1.22-bookworm AS builder
+FROM golang:1.25-bookworm AS builder
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
