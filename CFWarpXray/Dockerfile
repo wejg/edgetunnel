@@ -22,9 +22,11 @@ RUN curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --dearmor -o /u
     && apt update && apt install -y cloudflare-warp \
     && apt clean && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /var/log/warp-xray
+RUN mkdir -p /var/log/warp-xray /etc/cfwarpxray /var/lib/cloudflare-warp
 
 COPY --from=builder /cfwarpxray /usr/local/bin/cfwarpxray
+# Zero Trust 配置从 builder 阶段复制，确保任意构建上下文下镜像内都有该文件；可用 -v 挂载覆盖
+COPY --from=builder /app/config/zero-trust.yaml /etc/cfwarpxray/zero-trust.yaml
 
 EXPOSE 16666 16667
 
