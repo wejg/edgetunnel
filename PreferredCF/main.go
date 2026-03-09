@@ -1,10 +1,14 @@
 // PreferredCF：从指定 IP 库拉取 CF 候选 IP，测延迟后输出延迟最低的前 N 个。
+
+//  go run . --library=cf-official --max-ips=16 --top=2
+
 // 用法：go run . [--library=cm-list] [--port=443] [--top=16] [--concurrency=8] [--max-ips=512]
 package main
 
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -40,6 +44,103 @@ var ipLibraryURLs = map[string]string{
 // 拉取 IP 列表时允许的最大响应体大小，防止异常或恶意响应导致 OOM
 const maxFetchBodyBytes = 10 * 1024 * 1024 // 10MB
 
+// locToName 常见国家/地区代码到中文名的映射，用于表格展示
+var locToName = map[string]string{
+	"HK": "香港", "TW": "台湾", "JP": "日本", "KR": "韩国", "SG": "新加坡", "US": "美国",
+	"GB": "英国", "DE": "德国", "FR": "法国", "NL": "荷兰", "AU": "澳大利亚", "IN": "印度",
+	"CA": "加拿大", "BR": "巴西", "RU": "俄罗斯", "TH": "泰国", "MY": "马来西亚", "VN": "越南",
+	"PH": "菲律宾", "ID": "印尼", "ES": "西班牙", "IT": "意大利", "SE": "瑞典", "CH": "瑞士",
+}
+
+// locDisplay 返回 loc 的中文名，无则返回原代码
+func locDisplay(loc string) string {
+	if name, ok := locToName[strings.ToUpper(loc)]; ok {
+		return name
+	}
+	if loc != "" {
+		return loc
+	}
+	return "-"
+}
+
+// displayWidth 返回字符串在终端中的显示宽度（中文等宽字符算 2）
+func displayWidth(s string) int {
+	w := 0
+	for _, r := range s {
+		if r >= 0x4E00 && r <= 0x9FFF || r >= 0x3000 && r <= 0x303F || r >= 0xFF00 && r <= 0xFFEF || r >= 0xAC00 && r <= 0xD7AF {
+			w += 2
+		} else {
+			w += 1
+		}
+	}
+	return w
+}
+
+// padRight 将 s 右侧填充空格至目标显示宽度
+func padRight(s string, width int) string {
+	d := width - displayWidth(s)
+	if d <= 0 {
+		return s
+	}
+	return s + strings.Repeat(" ", d)
+}
+
+// printTable 按国家/地区分组输出表格，列：运营商 | 国家/地区 | 优选地址 | 往返延迟 | 数据中心 | 更新时间（按显示宽度对齐）
+func printTable(results []probeResult, carrier string) {
+	now := time.Now().Format("2006-01-02 15:04:05")
+	wCarrier, wLoc, wAddr, wDelay, wColo, wTime := 6, 10, 19, 10, 10, 19
+	fmt.Println("┌────────┬────────────┬─────────────────────┬────────────┬────────────┬─────────────────────┐")
+	fmt.Printf("│ %s │ %s │ %s │ %s │ %s │ %s │\n",
+		padRight("运营商", wCarrier), padRight("国家/地区", wLoc), padRight("优选地址", wAddr), padRight("往返延迟", wDelay), padRight("数据中心", wColo), padRight("更新时间", wTime))
+	fmt.Println("├────────┼────────────┼─────────────────────┼────────────┼────────────┼─────────────────────┤")
+	byLoc := make(map[string][]probeResult)
+	for _, r := range results {
+		loc := r.Loc
+		if loc == "" {
+			loc = "-"
+		}
+		byLoc[loc] = append(byLoc[loc], r)
+	}
+	// 优先顺序：香港、台湾、日本等常见，其余按字母
+	prio := []string{"HK", "TW", "JP", "SG", "KR", "US", "GB", "DE", "FR", "NL", "AU", "CA", "IN", "BR", "-"}
+	seen := make(map[string]bool)
+	firstRow := true
+	printLocGroup := func(loc string) {
+		items := byLoc[loc]
+		for _, r := range items {
+			addr := r.IPPort
+			if len(addr) > 19 {
+				addr = addr[:16] + "..."
+			}
+			delay := fmt.Sprintf("%d 毫秒", r.LatencyMs)
+			colo := r.Colo
+			if colo == "" {
+				colo = "-"
+			}
+			locName := locDisplay(loc)
+			carrierStr := ""
+			if firstRow {
+				carrierStr = carrier
+				firstRow = false
+			}
+			fmt.Printf("│ %s │ %s │ %s │ %s │ %s │ %s │\n",
+				padRight(carrierStr, wCarrier), padRight(locName, wLoc), padRight(addr, wAddr), padRight(delay, wDelay), padRight(colo, wColo), padRight(now, wTime))
+		}
+	}
+	for _, loc := range prio {
+		if items, ok := byLoc[loc]; ok && len(items) > 0 && !seen[loc] {
+			seen[loc] = true
+			printLocGroup(loc)
+		}
+	}
+	for loc, items := range byLoc {
+		if !seen[loc] && len(items) > 0 {
+			printLocGroup(loc)
+		}
+	}
+	fmt.Println("└────────┴────────────┴─────────────────────┴────────────┴────────────┴─────────────────────┘")
+}
+
 // logStderr 将进度日志打到 stderr，不影响 stdout 的 IP 结果输出（便于管道）
 func logStderr(format string, args ...interface{}) {
 	fmt.Fprintf(os.Stderr, "[优选] "+format+"\n", args...)
@@ -54,11 +155,12 @@ func exitWith(code int, format string, args ...interface{}) {
 func main() {
 	// 命令行参数：IP 库与测速/输出行为
 	library := flag.String("library", "cm-list", "IP library: cf-official, cm-list, as13335, as209242, reverse-proxy") // 候选 IP 来源：CIDR 或反代列表
-	port := flag.String("port", "443", "Port for probe and output")                                                     // 测速与输出使用的端口，需与节点一致
-	top := flag.Int("top", 16, "Number of lowest-latency IPs to output")                                                // 输出延迟最低的前 N 个，供订阅/配置使用
-	concurrency := flag.Int("concurrency", 8, "Concurrent probe workers (1-32)")                                        // 并发测速协程数，越大越快、占网越多
-	maxIPs := flag.Int("max-ips", 512, "Max candidate IPs to fetch/generate")                                           // 最多拉取/生成的候选 IP 数，CIDR 会随机生成至该数
-	quiet := flag.Bool("quiet", false, "Only output IP:port, no latency")                                               // 仅输出 IP:port，不输出延迟毫秒，便于管道处理
+	port := flag.String("port", "443", "Port for probe and output")                                                    // 测速与输出使用的端口，需与节点一致
+	top := flag.Int("top", 16, "Number of lowest-latency IPs to output")                                               // 输出延迟最低的前 N 个，供订阅/配置使用
+	concurrency := flag.Int("concurrency", 8, "Concurrent probe workers (1-32)")                                       // 并发测速协程数，越大越快、占网越多
+	maxIPs := flag.Int("max-ips", 512, "Max candidate IPs to fetch/generate")                                          // 最多拉取/生成的候选 IP 数，CIDR 会随机生成至该数
+	quiet := flag.Bool("quiet", false, "Only output IP:port, no latency")                                              // 仅输出 IP:port，不输出延迟毫秒，便于管道处理
+	format := flag.String("format", "table", "Output format: simple or table (formatted by country)")                  // 输出格式：simple=简洁，table=表格按国家分组
 	flag.Parse()
 
 	// 参数校验：避免无效输入导致静默异常或难以排查
@@ -84,7 +186,7 @@ func main() {
 
 	startMain := time.Now()
 	logStderr("======== 优选 IP 开始 ========")
-	logStderr("参数: library=%s | port=%s | top=%d | concurrency=%d | max-ips=%d | quiet=%v", *library, *port, *top, *concurrency, *maxIPs, *quiet)
+	logStderr("参数: library=%s | port=%s | top=%d | concurrency=%d | max-ips=%d | quiet=%v | format=%s", *library, *port, *top, *concurrency, *maxIPs, *quiet, *format)
 
 	url, ok := ipLibraryURLs[*library]
 	if !ok {
@@ -167,17 +269,49 @@ func main() {
 	}
 	results = results[:n]
 
+	// 从 trace 解析的客户端 IP 查运营商（电信/联通/移动）
+	clientIP := ""
+	if len(results) > 0 {
+		clientIP = results[0].ClientIP
+	}
+	carrier := getCarrierFromIP(clientIP)
+	if carrier != "-" {
+		logStderr("当前网络运营商: %s (IP: %s)", carrier, clientIP)
+	}
+
 	logStderr("---------- 输出 ----------")
-	logStderr("输出前 %d 个低延迟 IP (quiet=%v)", n, *quiet)
-	for i, r := range results {
-		if *quiet {
+	logStderr("输出前 %d 个低延迟 IP (quiet=%v, format=%s)", n, *quiet, *format)
+	if *quiet {
+		for _, r := range results {
 			fmt.Println(r.IPPort)
-		} else {
-			fmt.Printf("%s %dms\n", r.IPPort, r.LatencyMs)
 		}
-		if i < 3 {
-			logStderr("  第 %d: %s %dms", i+1, r.IPPort, r.LatencyMs)
+	} else if *format == "table" {
+		printTable(results, carrier)
+	} else {
+		// format=simple 或其他
+		for _, r := range results {
+			locColo := strings.TrimSpace(r.Loc + " " + r.Colo)
+			if locColo != "" {
+				fmt.Printf("%s %dms %s\n", r.IPPort, r.LatencyMs, locColo)
+			} else {
+				fmt.Printf("%s %dms\n", r.IPPort, r.LatencyMs)
+			}
 		}
+	}
+	for i := 0; i < n && i < 3; i++ {
+		r := results[i]
+		locColo := r.Loc
+		if r.Colo != "" {
+			if locColo != "" {
+				locColo += " " + r.Colo
+			} else {
+				locColo = r.Colo
+			}
+		}
+		if locColo == "" {
+			locColo = "-"
+		}
+		logStderr("  第 %d: %s %dms [%s]", i+1, r.IPPort, r.LatencyMs, locColo)
 	}
 	if n > 3 {
 		logStderr("  ... 共 %d 条 (以上仅展示前 3 条)", n)
@@ -427,10 +561,79 @@ func processPlainIPList(lines []string, port string, maxIPs int) ([]string, erro
 	return out, nil
 }
 
-// probeResult 单次测速结果：IP:port 与平均延迟（毫秒）
+// probeResult 单次测速结果：IP:port、平均延迟（毫秒）、CF 节点信息（国家/地区 loc、机房 colo）、客户端 IP（用于查运营商）
 type probeResult struct {
 	IPPort    string
 	LatencyMs int
+	Loc       string // 国家/地区代码，来自 cdn-cgi/trace 的 loc
+	Colo      string // 机房代码，来自 cdn-cgi/trace 的 colo
+	ClientIP  string // 客户端公网 IP，来自 trace 的 ip 字段，用于查运营商
+}
+
+// parseTraceBody 从 CF /cdn-cgi/trace 响应体解析 loc、colo、ip（客户端公网 IP），每行格式 key=value
+func parseTraceBody(body string) (loc, colo, clientIP string) {
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if k, v, ok := strings.Cut(line, "="); ok && len(v) > 0 {
+			v = strings.TrimSpace(v)
+			switch strings.TrimSpace(k) {
+			case "loc":
+				loc = v
+			case "colo":
+				colo = v
+			case "ip":
+				clientIP = v
+			}
+		}
+	}
+	return loc, colo, clientIP
+}
+
+// getCarrierFromIP 调用 ip-api.com 查询 IP 归属，返回 电信/联通/移动 或 其他/-（超时 5s）
+func getCarrierFromIP(ip string) string {
+	if ip == "" || net.ParseIP(ip) == nil {
+		return "-"
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	url := "http://ip-api.com/json/" + ip + "?fields=isp,org"
+	req, _ := http.NewRequest(http.MethodGet, url, nil)
+	req.Header.Set("User-Agent", fetchUserAgent)
+	resp, err := client.Do(req)
+	if err != nil {
+		return "-"
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "-"
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4*1024))
+	if err != nil {
+		return "-"
+	}
+	var data struct {
+		ISP string `json:"isp"`
+		Org string `json:"org"`
+	}
+	if json.Unmarshal(body, &data) != nil {
+		return "-"
+	}
+	s := strings.ToLower(data.ISP + " " + data.Org)
+	if strings.Contains(s, "telecom") || strings.Contains(s, "chinanet") || strings.Contains(s, "电信") {
+		return "电信"
+	}
+	if strings.Contains(s, "unicom") || strings.Contains(s, "china169") || strings.Contains(s, "联通") {
+		return "联通"
+	}
+	if strings.Contains(s, "mobile") || strings.Contains(s, "cmcc") || strings.Contains(s, "移动") {
+		return "移动"
+	}
+	if strings.Contains(s, "broad") || strings.Contains(s, "广电") {
+		return "广电"
+	}
+	if data.ISP != "" || data.Org != "" {
+		return "其他"
+	}
+	return "-"
 }
 
 // ipToHex 将 IPv4 转为十六进制字符串，用于 nip.lfree.org 子域名（如 1.2.3.4 -> 01020304）
@@ -450,7 +653,7 @@ func ipToHex(ip string) string {
 	return sb.String()
 }
 
-// probeSingle 对单个 IP 测速：请求 3 次 https://<hex>.nip.lfree.org:port/cdn-cgi/trace，丢弃第 1 次，取后 2 次平均。
+// probeSingle 对单个 IP 测速：请求 3 次 https://<hex>.nip.lfree.org:port/cdn-cgi/trace，丢弃第 1 次，取后 2 次平均；并解析 trace 得到 loc/colo。
 // 延迟 = 从发起请求到读完全部响应 body 的耗时（更准），避免只测到“首包”时间。
 func probeSingle(client *http.Client, ipPort, port string) *probeResult {
 	ipPortForParse := ipPort
@@ -466,6 +669,7 @@ func probeSingle(client *http.Client, ipPort, port string) *probeResult {
 		return nil
 	}
 	var times []float64
+	var lastLoc, lastColo, lastClientIP string
 	for i := 0; i < probeRuns; i++ {
 		u := fmt.Sprintf("https://%s.nip.lfree.org:%s/cdn-cgi/trace?_t=%d", hexIP, port, time.Now().UnixNano())
 		start := time.Now()
@@ -483,8 +687,8 @@ func probeSingle(client *http.Client, ipPort, port string) *probeResult {
 			}
 			continue
 		}
-		// 读完全部 body 再计时，得到的是完整往返延迟；读不完整则本次不计入
-		_, copyErr := io.Copy(io.Discard, resp.Body)
+		// 读完全部 body 再计时，并解析 trace 得到 loc/colo
+		body, copyErr := io.ReadAll(io.LimitReader(resp.Body, 4*1024))
 		_ = resp.Body.Close()
 		if copyErr != nil {
 			if i == 0 {
@@ -495,6 +699,7 @@ func probeSingle(client *http.Client, ipPort, port string) *probeResult {
 		elapsed := time.Since(start).Seconds() * 1000
 		if i >= probeSkip {
 			times = append(times, elapsed)
+			lastLoc, lastColo, lastClientIP = parseTraceBody(string(body))
 		}
 	}
 	if len(times) == 0 {
@@ -505,7 +710,7 @@ func probeSingle(client *http.Client, ipPort, port string) *probeResult {
 		sum += t
 	}
 	avg := int(sum/float64(len(times)) + 0.5)
-	return &probeResult{IPPort: ipPort, LatencyMs: avg}
+	return &probeResult{IPPort: ipPort, LatencyMs: avg, Loc: lastLoc, Colo: lastColo, ClientIP: lastClientIP}
 }
 
 // probeConcurrent 使用 worker 池并发测速，定期打印进度（已测数量/总数）；连接单独超时便于区分连不上与连上但慢
@@ -575,4 +780,3 @@ func probeConcurrent(candidates []string, port string, concurrency int) []probeR
 	}
 	return out
 }
-
