@@ -44,23 +44,47 @@ var ipLibraryURLs = map[string]string{
 // 拉取 IP 列表时允许的最大响应体大小，防止异常或恶意响应导致 OOM
 const maxFetchBodyBytes = 10 * 1024 * 1024 // 10MB
 
-// locToName 常见国家/地区代码到中文名的映射，用于表格展示
+// locToName 国家/地区代码到中文名的映射
 var locToName = map[string]string{
 	"HK": "香港", "TW": "台湾", "JP": "日本", "KR": "韩国", "SG": "新加坡", "US": "美国",
 	"GB": "英国", "DE": "德国", "FR": "法国", "NL": "荷兰", "AU": "澳大利亚", "IN": "印度",
 	"CA": "加拿大", "BR": "巴西", "RU": "俄罗斯", "TH": "泰国", "MY": "马来西亚", "VN": "越南",
 	"PH": "菲律宾", "ID": "印尼", "ES": "西班牙", "IT": "意大利", "SE": "瑞典", "CH": "瑞士",
+	"IE": "爱尔兰",
 }
 
-// locDisplay 返回 loc 的中文名，无则返回原代码
-func locDisplay(loc string) string {
-	if name, ok := locToName[strings.ToUpper(loc)]; ok {
+// coloToCountry CF 机房代码(IATA)到国家代码的映射；trace 的 loc=客户端位置，colo=机房，表格应显示机房所在国家
+var coloToCountry = map[string]string{
+	"AMS": "NL", "HKG": "HK", "SJC": "US", "LAX": "US", "SEA": "US", "DFW": "US", "ORD": "US",
+	"IAD": "US", "EWR": "US", "ATL": "US", "MIA": "US", "SFO": "US", "NRT": "JP", "TPE": "TW",
+	"SIN": "SG", "FRA": "DE", "LHR": "GB", "CDG": "FR", "SYD": "AU", "BOM": "IN", "GRU": "BR",
+	"YYZ": "CA", "MAD": "ES", "MXP": "IT", "ARN": "SE", "ZRH": "CH", "DUB": "IE", "SVO": "RU",
+	"ICN": "KR", "KUL": "MY", "BKK": "TH", "SGN": "VN", "MNL": "PH", "CGK": "ID", "DEL": "IN",
+}
+
+// coloDisplay 从 CF 机房代码得到机房所在国家的中文名（用于表格「国家/地区」列，显示的是 CF 节点所在国，非客户端归属地）
+func coloDisplay(colo string) string {
+	colo = strings.ToUpper(strings.TrimSpace(colo))
+	if colo == "" {
+		return "-"
+	}
+	country := colo
+	if c, ok := coloToCountry[colo]; ok {
+		country = c
+	} else if len(colo) >= 3 {
+		// 兼容 ams01 格式，取前 3 位匹配
+		if c, ok := coloToCountry[colo[:3]]; ok {
+			country = c
+		} else {
+			country = colo[:2]
+		}
+	} else if len(colo) >= 2 {
+		country = colo[:2]
+	}
+	if name, ok := locToName[country]; ok {
 		return name
 	}
-	if loc != "" {
-		return loc
-	}
-	return "-"
+	return colo
 }
 
 // displayWidth 返回字符串在终端中的显示宽度（中文等宽字符算 2）
@@ -85,7 +109,7 @@ func padRight(s string, width int) string {
 	return s + strings.Repeat(" ", d)
 }
 
-// printTable 按国家/地区分组输出表格，列：运营商 | 国家/地区 | 优选地址 | 往返延迟 | 数据中心 | 更新时间（按显示宽度对齐）
+// printTable 按 CF 机房所在国家分组输出表格；国家/地区=机房所在国（非客户端归属地），列：运营商 | 国家/地区 | 优选地址 | 往返延迟 | 数据中心 | 更新时间
 func printTable(results []probeResult, carrier string) {
 	now := time.Now().Format("2006-01-02 15:04:05")
 	wCarrier, wLoc, wAddr, wDelay, wColo, wTime := 6, 10, 19, 10, 10, 19
@@ -93,49 +117,50 @@ func printTable(results []probeResult, carrier string) {
 	fmt.Printf("│ %s │ %s │ %s │ %s │ %s │ %s │\n",
 		padRight("运营商", wCarrier), padRight("国家/地区", wLoc), padRight("优选地址", wAddr), padRight("往返延迟", wDelay), padRight("数据中心", wColo), padRight("更新时间", wTime))
 	fmt.Println("├────────┼────────────┼─────────────────────┼────────────┼────────────┼─────────────────────┤")
-	byLoc := make(map[string][]probeResult)
+	// 按 colo（CF 机房）分组，国家/地区 = 机房所在国，非客户端归属地
+	byColo := make(map[string][]probeResult)
 	for _, r := range results {
-		loc := r.Loc
-		if loc == "" {
-			loc = "-"
+		colo := r.Colo
+		if colo == "" {
+			colo = "-"
 		}
-		byLoc[loc] = append(byLoc[loc], r)
+		byColo[colo] = append(byColo[colo], r)
 	}
-	// 优先顺序：香港、台湾、日本等常见，其余按字母
-	prio := []string{"HK", "TW", "JP", "SG", "KR", "US", "GB", "DE", "FR", "NL", "AU", "CA", "IN", "BR", "-"}
+	// 优先顺序按常见机房
+	prio := []string{"HKG", "TPE", "NRT", "SIN", "ICN", "SJC", "LAX", "AMS", "FRA", "LHR", "SYD", "-"}
 	seen := make(map[string]bool)
 	firstRow := true
-	printLocGroup := func(loc string) {
-		items := byLoc[loc]
+	printColoGroup := func(colo string) {
+		items := byColo[colo]
 		for _, r := range items {
 			addr := r.IPPort
 			if len(addr) > 19 {
 				addr = addr[:16] + "..."
 			}
 			delay := fmt.Sprintf("%d 毫秒", r.LatencyMs)
-			colo := r.Colo
-			if colo == "" {
-				colo = "-"
+			coloStr := r.Colo
+			if coloStr == "" {
+				coloStr = "-"
 			}
-			locName := locDisplay(loc)
+			countryName := coloDisplay(colo)
 			carrierStr := ""
 			if firstRow {
 				carrierStr = carrier
 				firstRow = false
 			}
 			fmt.Printf("│ %s │ %s │ %s │ %s │ %s │ %s │\n",
-				padRight(carrierStr, wCarrier), padRight(locName, wLoc), padRight(addr, wAddr), padRight(delay, wDelay), padRight(colo, wColo), padRight(now, wTime))
+				padRight(carrierStr, wCarrier), padRight(countryName, wLoc), padRight(addr, wAddr), padRight(delay, wDelay), padRight(coloStr, wColo), padRight(now, wTime))
 		}
 	}
-	for _, loc := range prio {
-		if items, ok := byLoc[loc]; ok && len(items) > 0 && !seen[loc] {
-			seen[loc] = true
-			printLocGroup(loc)
+	for _, colo := range prio {
+		if items, ok := byColo[colo]; ok && len(items) > 0 && !seen[colo] {
+			seen[colo] = true
+			printColoGroup(colo)
 		}
 	}
-	for loc, items := range byLoc {
-		if !seen[loc] && len(items) > 0 {
-			printLocGroup(loc)
+	for colo, items := range byColo {
+		if !seen[colo] && len(items) > 0 {
+			printColoGroup(colo)
 		}
 	}
 	fmt.Println("└────────┴────────────┴─────────────────────┴────────────┴────────────┴─────────────────────┘")
